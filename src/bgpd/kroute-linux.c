@@ -465,7 +465,7 @@ kr_change(u_int rtableid, struct kroute_full *kf)
 int
 kr4_change(struct ktable *kt, struct kroute_full *kf)
 {
-	struct kroute	*kr;
+	struct kroute	*kr, *krn;
 
 	/* for blackhole and reject routes nexthop needs to be 127.0.0.1 */
 	if (kf->flags & (F_BLACKHOLE|F_REJECT))
@@ -479,6 +479,31 @@ kr4_change(struct ktable *kt, struct kroute_full *kf)
 	    kf->priority)) == NULL) {
 		if (kroute_insert(kt, kf) == -1)
 			return (-1);
+	} else if ((kf->flags & F_ECMP) &&
+	    kroute_matchgw(kr, kf) == NULL) {
+		/*
+		 * ECMP multipath: prefix exists but this is a new nexthop.
+		 * Chain onto the multipath list, then reinstall the route
+		 * with all nexthops via RTA_MULTIPATH.
+		 */
+		if ((krn = calloc(1, sizeof(*krn))) == NULL) {
+			log_warn("%s", __func__);
+			return (-1);
+		}
+		krn->prefix = kf->prefix.v4;
+		krn->prefixlen = kf->prefixlen;
+		krn->nexthop = kf->nexthop.v4;
+		krn->flags = kf->flags;
+		krn->ifindex = kf->ifindex;
+		krn->priority = kf->priority;
+		krn->labelid = rtlabel_name2id(kf->label);
+
+		while (kr->next != NULL)
+			kr = kr->next;
+		kr->next = krn;
+
+		if (send_rtmsg(RTM_CHANGE, kt, kf))
+			krn->flags |= F_BGPD_INSERTED;
 	} else {
 		kr->nexthop.s_addr = kf->nexthop.v4.s_addr;
 		rtlabel_unref(kr->labelid);
@@ -491,6 +516,10 @@ kr4_change(struct ktable *kt, struct kroute_full *kf)
 			kr->flags |= F_REJECT;
 		else
 			kr->flags &= ~F_REJECT;
+		if (kf->flags & F_ECMP)
+			kr->flags |= F_ECMP;
+		else
+			kr->flags &= ~F_ECMP;
 
 		if (kr->flags & F_NEXTHOP)
 			knexthop_update(kt, kf);
@@ -505,7 +534,7 @@ kr4_change(struct ktable *kt, struct kroute_full *kf)
 int
 kr6_change(struct ktable *kt, struct kroute_full *kf)
 {
-	struct kroute6	*kr6;
+	struct kroute6	*kr6, *kr6n;
 	struct in6_addr	 lo6 = IN6ADDR_LOOPBACK_INIT;
 
 	/* for blackhole and reject routes nexthop needs to be ::1 */
@@ -519,6 +548,33 @@ kr6_change(struct ktable *kt, struct kroute_full *kf)
 	    kf->priority)) == NULL) {
 		if (kroute_insert(kt, kf) == -1)
 			return (-1);
+	} else if ((kf->flags & F_ECMP) &&
+	    kroute6_matchgw(kr6, kf) == NULL) {
+		/*
+		 * ECMP multipath: prefix exists but this is a new nexthop.
+		 * Chain onto the multipath list, then reinstall the route
+		 * with all nexthops via RTA_MULTIPATH.
+		 */
+		if ((kr6n = calloc(1, sizeof(*kr6n))) == NULL) {
+			log_warn("%s", __func__);
+			return (-1);
+		}
+		kr6n->prefix = kf->prefix.v6;
+		kr6n->prefix_scope_id = kf->prefix.scope_id;
+		kr6n->prefixlen = kf->prefixlen;
+		kr6n->nexthop = kf->nexthop.v6;
+		kr6n->nexthop_scope_id = kf->nexthop.scope_id;
+		kr6n->flags = kf->flags;
+		kr6n->ifindex = kf->ifindex;
+		kr6n->priority = kf->priority;
+		kr6n->labelid = rtlabel_name2id(kf->label);
+
+		while (kr6->next != NULL)
+			kr6 = kr6->next;
+		kr6->next = kr6n;
+
+		if (send_rtmsg(RTM_CHANGE, kt, kf))
+			kr6n->flags |= F_BGPD_INSERTED;
 	} else {
 		memcpy(&kr6->nexthop, &kf->nexthop.v6, sizeof(struct in6_addr));
 		kr6->nexthop_scope_id = kf->nexthop.scope_id;
@@ -532,6 +588,10 @@ kr6_change(struct ktable *kt, struct kroute_full *kf)
 			kr6->flags |= F_REJECT;
 		else
 			kr6->flags &= ~F_REJECT;
+		if (kf->flags & F_ECMP)
+			kr6->flags |= F_ECMP;
+		else
+			kr6->flags &= ~F_ECMP;
 
 		if (kr6->flags & F_NEXTHOP)
 			knexthop_update(kt, kf);
@@ -1662,7 +1722,7 @@ kroute_insert(struct ktable *kt, struct kroute_full *kf)
 			multipath = 1;
 		}
 
-		if (kf->flags & F_BGPD)
+		if ((kf->flags & F_BGPD) && !multipath)
 			if (send_rtmsg(RTM_ADD, kt, kf))
 				kr->flags |= F_BGPD_INSERTED;
 		break;
@@ -1699,7 +1759,7 @@ kroute_insert(struct ktable *kt, struct kroute_full *kf)
 			multipath = 1;
 		}
 
-		if (kf->flags & F_BGPD)
+		if ((kf->flags & F_BGPD) && !multipath)
 			if (send_rtmsg(RTM_ADD, kt, kf))
 				kr6->flags |= F_BGPD_INSERTED;
 		break;
@@ -1865,6 +1925,7 @@ kroute6_remove(struct ktable *kt, struct kroute_full *kf, int any)
 int
 kroute_remove(struct ktable *kt, struct kroute_full *kf, int any)
 {
+	struct kroute_full	 ekf;
 	int multipath;
 
 	switch (kf->prefix.aid) {
@@ -1882,8 +1943,50 @@ kroute_remove(struct ktable *kt, struct kroute_full *kf, int any)
 	if (multipath < 0)
 		return (multipath + 1);
 
-	if (kf->flags & F_BGPD_INSERTED)
-		send_rtmsg(RTM_DELETE, kt, kf);
+	if (kf->flags & F_BGPD_INSERTED) {
+		if (multipath && (kf->flags & F_ECMP)) {
+			/*
+			 * ECMP: sibling nexthops remain. Reinstall the route
+			 * with the reduced set instead of deleting it.
+			 * Build ekf from the remaining chain head so the
+			 * single-path fallback uses the correct nexthop.
+			 */
+			memset(&ekf, 0, sizeof(ekf));
+			ekf.prefix = kf->prefix;
+			ekf.prefixlen = kf->prefixlen;
+			ekf.priority = kf->priority;
+			ekf.flags = kf->flags;
+			switch (kf->prefix.aid) {
+			case AID_INET: {
+				struct kroute *kr;
+				kr = kroute_find(kt, &kf->prefix,
+				    kf->prefixlen, kf->priority);
+				if (kr != NULL) {
+					ekf.nexthop.aid = AID_INET;
+					ekf.nexthop.v4 = kr->nexthop;
+					ekf.ifindex = kr->ifindex;
+				}
+				break;
+			}
+			case AID_INET6: {
+				struct kroute6 *kr6;
+				kr6 = kroute6_find(kt, &kf->prefix,
+				    kf->prefixlen, kf->priority);
+				if (kr6 != NULL) {
+					ekf.nexthop.aid = AID_INET6;
+					ekf.nexthop.v6 = kr6->nexthop;
+					ekf.nexthop.scope_id =
+					    kr6->nexthop_scope_id;
+					ekf.ifindex = kr6->ifindex;
+				}
+				break;
+			}
+			}
+			send_rtmsg(RTM_CHANGE, kt, &ekf);
+		} else {
+			send_rtmsg(RTM_DELETE, kt, kf);
+		}
+	}
 
 	/* remove only once all multipath routes are gone */
 	if (!(kf->flags & F_BGPD) && !multipath)
@@ -2639,6 +2742,123 @@ get_mpe_config(const char *name, u_int *rdomain, u_int *label)
 /*
  * rtsock related functions
  */
+
+/*
+ * Build an RTA_MULTIPATH attribute with all BGPD-inserted next-hops
+ * for the given prefix.  The payload is built as a raw buffer of
+ * rtnexthop + RTA_GATEWAY pairs, then attached to the netlink message.
+ * Returns the number of next-hops added, or 0 if not applicable.
+ */
+static int
+add_multipath_attr(struct nlmsghdr *nlh, struct ktable *kt,
+    struct kroute_full *kf)
+{
+	char		 mpbuf[512];
+	size_t		 off = 0;
+	int		 nhops = 0;
+
+	switch (kf->prefix.aid) {
+	case AID_INET: {
+		struct kroute	*kr, *km;
+		size_t		 gwlen = sizeof(uint32_t);
+		size_t		 nhlen;
+
+		kr = kroute_find(kt, &kf->prefix, kf->prefixlen, RTP_MINE);
+		if (kr == NULL || kr->next == NULL)
+			return (0);
+
+		nhlen = RTNH_ALIGN(sizeof(struct rtnexthop)) +
+		    RTA_SPACE(gwlen);
+
+		for (km = kr; km != NULL; km = km->next) {
+			struct rtnexthop *rtnh;
+			struct rtattr *rta;
+
+			if (!(km->flags & F_BGPD))
+				continue;
+			if (off + nhlen > sizeof(mpbuf))
+				break;
+
+			rtnh = (struct rtnexthop *)(mpbuf + off);
+			rtnh->rtnh_len = nhlen;
+			rtnh->rtnh_flags = 0;
+			rtnh->rtnh_hops = 0;
+			rtnh->rtnh_ifindex = km->ifindex;
+
+			rta = (struct rtattr *)(mpbuf + off +
+			    RTNH_ALIGN(sizeof(struct rtnexthop)));
+			rta->rta_type = RTA_GATEWAY;
+			rta->rta_len = RTA_LENGTH(gwlen);
+			memcpy(RTA_DATA(rta), &km->nexthop.s_addr, gwlen);
+
+			off += nhlen;
+			nhops++;
+		}
+		break;
+	}
+	case AID_INET6: {
+		struct kroute6	*kr6, *km6;
+		size_t		 gwlen = sizeof(struct in6_addr);
+		size_t		 nhlen;
+
+		kr6 = kroute6_find(kt, &kf->prefix, kf->prefixlen, RTP_MINE);
+		if (kr6 == NULL || kr6->next == NULL)
+			return (0);
+
+		nhlen = RTNH_ALIGN(sizeof(struct rtnexthop)) +
+		    RTA_SPACE(gwlen);
+
+		for (km6 = kr6; km6 != NULL; km6 = km6->next) {
+			struct rtnexthop *rtnh;
+			struct rtattr *rta;
+			u_short ifidx;
+
+			if (!(km6->flags & F_BGPD))
+				continue;
+			if (off + nhlen > sizeof(mpbuf))
+				break;
+
+			ifidx = km6->ifindex;
+			if (ifidx == 0) {
+				struct bgpd_addr nh;
+				struct kroute6 *nhkr;
+				memset(&nh, 0, sizeof(nh));
+				nh.aid = AID_INET6;
+				nh.v6 = km6->nexthop;
+				nhkr = kroute6_match(kt, &nh, 0);
+				if (nhkr != NULL)
+					ifidx = nhkr->ifindex;
+			}
+
+			rtnh = (struct rtnexthop *)(mpbuf + off);
+			rtnh->rtnh_len = nhlen;
+			rtnh->rtnh_flags = RTNH_F_ONLINK;
+			rtnh->rtnh_hops = 0;
+			rtnh->rtnh_ifindex = ifidx;
+
+			rta = (struct rtattr *)(mpbuf + off +
+			    RTNH_ALIGN(sizeof(struct rtnexthop)));
+			rta->rta_type = RTA_GATEWAY;
+			rta->rta_len = RTA_LENGTH(gwlen);
+			memcpy(RTA_DATA(rta), &km6->nexthop, gwlen);
+
+			off += nhlen;
+			nhops++;
+		}
+		break;
+	}
+	default:
+		return (0);
+	}
+
+	if (nhops >= 2)
+		mnl_attr_put(nlh, RTA_MULTIPATH, off, mpbuf);
+	else
+		nhops = 0;
+
+	return (nhops);
+}
+
 int
 send_rtmsg(int action, struct ktable *kt, struct kroute_full *kf)
 {
@@ -2681,21 +2901,42 @@ send_rtmsg(int action, struct ktable *kt, struct kroute_full *kf)
 	switch (kf->prefix.aid) {
 	case AID_INET:
 		mnl_attr_put_u32(nlh, RTA_DST, kf->prefix.v4.s_addr);
-		if (kf->nexthop.aid != AID_UNSPEC)
-			mnl_attr_put_u32(nlh, RTA_GATEWAY,
-			    kf->nexthop.v4.s_addr);
 		break;
 	case AID_INET6:
 		mnl_attr_put(nlh, RTA_DST, sizeof(struct in6_addr),
 		    &kf->prefix.v6);
-		if (kf->nexthop.aid != AID_UNSPEC)
-			mnl_attr_put(nlh, RTA_GATEWAY, sizeof(struct in6_addr),
-			    &kf->nexthop.v6);
 		break;
 	default:
 		log_warn("%s: unsupported address family %s", __func__,
 		    aid2str(kf->prefix.aid));
 		return (-1);
+	}
+
+	/*
+	 * For add/change with F_ECMP: install all equal-cost next-hops
+	 * as a multipath route via RTA_MULTIPATH.  Only triggered by
+	 * the "set fib-multipath" filter action.  Falls back to single
+	 * RTA_GATEWAY for non-ECMP routes, deletes, or blackholes.
+	 */
+	if (action != RTM_DELETE &&
+	    (kf->flags & F_ECMP) &&
+	    !(kf->flags & (F_BLACKHOLE|F_REJECT)) &&
+	    add_multipath_attr(nlh, kt, kf) > 0) {
+		/* multipath nexthops added */
+	} else {
+		switch (kf->prefix.aid) {
+		case AID_INET:
+			if (kf->nexthop.aid != AID_UNSPEC)
+				mnl_attr_put_u32(nlh, RTA_GATEWAY,
+				    kf->nexthop.v4.s_addr);
+			break;
+		case AID_INET6:
+			if (kf->nexthop.aid != AID_UNSPEC)
+				mnl_attr_put(nlh, RTA_GATEWAY,
+				    sizeof(struct in6_addr),
+				    &kf->nexthop.v6);
+			break;
+		}
 	}
 
 	if (mnl_socket_sendto(kr_state.nl, nlh, nlh->nlmsg_len) < 0) {
