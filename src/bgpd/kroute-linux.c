@@ -1944,13 +1944,13 @@ kroute_remove(struct ktable *kt, struct kroute_full *kf, int any)
 		return (multipath + 1);
 
 	if (kf->flags & F_BGPD_INSERTED) {
-		if (multipath && (kf->flags & F_ECMP)) {
+		if (multipath) {
 			/*
-			 * ECMP: sibling nexthops remain. Reinstall the route
-			 * with the reduced set instead of deleting it.
-			 * Build ekf from the remaining chain head so the
-			 * single-path fallback uses the correct nexthop.
+			 * Multipath: sibling nexthops remain. Delete the
+			 * old route and reinstall with the reduced set.
+			 * Build ekf from the remaining chain head.
 			 */
+			send_rtmsg(RTM_DELETE, kt, kf);
 			memset(&ekf, 0, sizeof(ekf));
 			ekf.prefix = kf->prefix;
 			ekf.prefixlen = kf->prefixlen;
@@ -1982,7 +1982,7 @@ kroute_remove(struct ktable *kt, struct kroute_full *kf, int any)
 				break;
 			}
 			}
-			send_rtmsg(RTM_CHANGE, kt, &ekf);
+			send_rtmsg(RTM_ADD, kt, &ekf);
 		} else {
 			send_rtmsg(RTM_DELETE, kt, kf);
 		}
