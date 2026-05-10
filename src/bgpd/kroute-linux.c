@@ -1947,10 +1947,16 @@ kroute_remove(struct ktable *kt, struct kroute_full *kf, int any)
 		if (multipath) {
 			/*
 			 * Multipath: sibling nexthops remain. Delete the
-			 * old route and reinstall with the reduced set.
-			 * Build ekf from the remaining chain head.
+			 * entire old route (clear nexthop so kernel removes
+			 * all nexthops, not just one) and reinstall with
+			 * the reduced set.
 			 */
-			send_rtmsg(RTM_DELETE, kt, kf);
+			memset(&ekf, 0, sizeof(ekf));
+			ekf.prefix = kf->prefix;
+			ekf.prefixlen = kf->prefixlen;
+			ekf.priority = kf->priority;
+			ekf.flags = kf->flags;
+			send_rtmsg(RTM_DELETE, kt, &ekf);
 			memset(&ekf, 0, sizeof(ekf));
 			ekf.prefix = kf->prefix;
 			ekf.prefixlen = kf->prefixlen;
