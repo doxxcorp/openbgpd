@@ -519,6 +519,33 @@ kr4_change(struct ktable *kt, struct kroute_full *kf)
 		if (send_rtmsg(RTM_CHANGE, kt, kf))
 			kr->flags |= F_BGPD_INSERTED;
 	} else {
+		/*
+		 * Multipath to single-path transition: when the chain has
+		 * stale nexthops (kr->next != NULL) but the update is not
+		 * ECMP, delete the old multipath route from the kernel and
+		 * purge stale chain entries before installing the single
+		 * nexthop. The kernel won't replace a multipath route with
+		 * a single-nexthop route via NLM_F_REPLACE alone.
+		 */
+		int was_multipath = (kr->next != NULL);
+		if (was_multipath && !(kf->flags & F_ECMP)) {
+			struct kroute_full ekf;
+			struct kroute *stale, *snext;
+
+			memset(&ekf, 0, sizeof(ekf));
+			ekf.prefix = kf->prefix;
+			ekf.prefixlen = kf->prefixlen;
+			ekf.priority = kf->priority;
+			ekf.flags = kr->flags;
+			send_rtmsg(RTM_DELETE, kt, &ekf);
+
+			for (stale = kr->next; stale != NULL; stale = snext) {
+				snext = stale->next;
+				rtlabel_unref(stale->labelid);
+				free(stale);
+			}
+			kr->next = NULL;
+		}
 		kr->nexthop.s_addr = kf->nexthop.v4.s_addr;
 		rtlabel_unref(kr->labelid);
 		kr->labelid = rtlabel_name2id(kf->label);
@@ -538,7 +565,7 @@ kr4_change(struct ktable *kt, struct kroute_full *kf)
 		if (kr->flags & F_NEXTHOP)
 			knexthop_update(kt, kf);
 
-		if (send_rtmsg(RTM_CHANGE, kt, kf))
+		if (send_rtmsg(was_multipath ? RTM_ADD : RTM_CHANGE, kt, kf))
 			kr->flags |= F_BGPD_INSERTED;
 	}
 
@@ -593,6 +620,25 @@ kr6_change(struct ktable *kt, struct kroute_full *kf)
 		if (send_rtmsg(RTM_CHANGE, kt, kf))
 			kr6->flags |= F_BGPD_INSERTED;
 	} else {
+		int was_multipath = (kr6->next != NULL);
+		if (was_multipath && !(kf->flags & F_ECMP)) {
+			struct kroute_full ekf;
+			struct kroute6 *stale, *snext;
+
+			memset(&ekf, 0, sizeof(ekf));
+			ekf.prefix = kf->prefix;
+			ekf.prefixlen = kf->prefixlen;
+			ekf.priority = kf->priority;
+			ekf.flags = kr6->flags;
+			send_rtmsg(RTM_DELETE, kt, &ekf);
+
+			for (stale = kr6->next; stale != NULL; stale = snext) {
+				snext = stale->next;
+				rtlabel_unref(stale->labelid);
+				free(stale);
+			}
+			kr6->next = NULL;
+		}
 		memcpy(&kr6->nexthop, &kf->nexthop.v6, sizeof(struct in6_addr));
 		kr6->nexthop_scope_id = kf->nexthop.scope_id;
 		rtlabel_unref(kr6->labelid);
@@ -613,7 +659,7 @@ kr6_change(struct ktable *kt, struct kroute_full *kf)
 		if (kr6->flags & F_NEXTHOP)
 			knexthop_update(kt, kf);
 
-		if (send_rtmsg(RTM_CHANGE, kt, kf))
+		if (send_rtmsg(was_multipath ? RTM_ADD : RTM_CHANGE, kt, kf))
 			kr6->flags |= F_BGPD_INSERTED;
 	}
 

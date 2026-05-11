@@ -570,6 +570,8 @@ prefix_evaluate(struct rib_entry *re, struct prefix *new, struct prefix *old)
 	/*
 	 * ECMP: best didn't change but the ECMP set may have changed.
 	 * Resend the kroute so the FIB multipath nexthop set is updated.
+	 * Also resend when an ECMP sibling was removed (old != NULL) so
+	 * the kernel route is updated from multipath to single-path.
 	 */
 	if (newbest != NULL && (rib->flags & F_RIB_NOFIB) == 0 &&
 	    (new != NULL || old != NULL)) {
@@ -581,6 +583,8 @@ prefix_evaluate(struct rib_entry *re, struct prefix *new, struct prefix *old)
 			ecmp = 1;
 		if (ecmp && ep != NULL &&
 		    ep->dmetric == PREFIX_DMETRIC_ECMP)
+			rde_send_kroute(rib, newbest, NULL);
+		else if (old != NULL)
 			rde_send_kroute(rib, newbest, NULL);
 	}
 
