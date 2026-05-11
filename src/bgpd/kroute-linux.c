@@ -510,6 +510,14 @@ kr4_change(struct ktable *kt, struct kroute_full *kf)
 
 		if (send_rtmsg(RTM_CHANGE, kt, kf))
 			krn->flags |= F_BGPD_INSERTED;
+	} else if ((kf->flags & F_ECMP) && kr->next != NULL) {
+		/*
+		 * ECMP: matchgw found this nexthop already in the chain.
+		 * Just resend the multipath route without modifying the
+		 * head entry's nexthop (which may differ from kf->nexthop).
+		 */
+		if (send_rtmsg(RTM_CHANGE, kt, kf))
+			kr->flags |= F_BGPD_INSERTED;
 	} else {
 		kr->nexthop.s_addr = kf->nexthop.v4.s_addr;
 		rtlabel_unref(kr->labelid);
@@ -552,19 +560,10 @@ kr6_change(struct ktable *kt, struct kroute_full *kf)
 
 	if ((kr6 = kroute6_find(kt, &kf->prefix, kf->prefixlen,
 	    kf->priority)) == NULL) {
-		if (kf->flags & F_ECMP)
-			log_warnx("ECMP v6: %s/%u nh %s NEW (insert) "
-			    "flags=0x%04x ifindex=%u",
-			    log_addr(&kf->prefix), kf->prefixlen,
-			    log_addr(&kf->nexthop), kf->flags, kf->ifindex);
 		if (kroute_insert(kt, kf) == -1)
 			return (-1);
 	} else if ((kf->flags & F_ECMP) &&
 	    kroute6_matchgw(kr6, kf) == NULL) {
-		log_warnx("ECMP v6: %s/%u nh %s CHAIN (sibling) "
-		    "flags=0x%04x ifindex=%u",
-		    log_addr(&kf->prefix), kf->prefixlen,
-		    log_addr(&kf->nexthop), kf->flags, kf->ifindex);
 		if ((kr6n = calloc(1, sizeof(*kr6n))) == NULL) {
 			log_warn("%s", __func__);
 			return (-1);
@@ -585,12 +584,15 @@ kr6_change(struct ktable *kt, struct kroute_full *kf)
 
 		if (send_rtmsg(RTM_CHANGE, kt, kf))
 			kr6n->flags |= F_BGPD_INSERTED;
+	} else if ((kf->flags & F_ECMP) && kr6->next != NULL) {
+		/*
+		 * ECMP: matchgw found this nexthop already in the chain.
+		 * Just resend the multipath route without modifying the
+		 * head entry's nexthop (which may differ from kf->nexthop).
+		 */
+		if (send_rtmsg(RTM_CHANGE, kt, kf))
+			kr6->flags |= F_BGPD_INSERTED;
 	} else {
-		if (kf->flags & F_ECMP)
-			log_warnx("ECMP v6: %s/%u nh %s OVERWRITE "
-			    "(matchgw hit) flags=0x%04x",
-			    log_addr(&kf->prefix), kf->prefixlen,
-			    log_addr(&kf->nexthop), kf->flags);
 		memcpy(&kr6->nexthop, &kf->nexthop.v6, sizeof(struct in6_addr));
 		kr6->nexthop_scope_id = kf->nexthop.scope_id;
 		rtlabel_unref(kr6->labelid);
@@ -2821,23 +2823,12 @@ add_multipath_attr(struct nlmsghdr *nlh, struct ktable *kt,
 		struct kroute6	*kr6, *km6;
 		size_t		 gwlen = sizeof(struct in6_addr);
 		size_t		 nhlen;
-		char		 nhbuf[INET6_ADDRSTRLEN];
 
 		kr6 = kroute6_find(kt, &kf->prefix, kf->prefixlen, RTP_MINE);
-		if (kr6 == NULL) {
-			log_warnx("ECMP v6 multipath: %s/%u kr6 not found",
-			    log_addr(&kf->prefix), kf->prefixlen);
+		if (kr6 == NULL)
 			return (0);
-		}
-		if (kr6->next == NULL) {
-			inet_ntop(AF_INET6, &kr6->nexthop, nhbuf,
-			    sizeof(nhbuf));
-			log_warnx("ECMP v6 multipath: %s/%u only 1 nh (%s) "
-			    "flags=0x%04x, no multipath",
-			    log_addr(&kf->prefix), kf->prefixlen,
-			    nhbuf, kr6->flags);
+		if (kr6->next == NULL)
 			return (0);
-		}
 
 		nhlen = RTNH_ALIGN(sizeof(struct rtnexthop)) +
 		    RTA_SPACE(gwlen);
@@ -2847,14 +2838,8 @@ add_multipath_attr(struct nlmsghdr *nlh, struct ktable *kt,
 			struct rtattr *rta;
 			u_short ifidx;
 
-			if (!(km6->flags & F_BGPD)) {
-				inet_ntop(AF_INET6, &km6->nexthop, nhbuf,
-				    sizeof(nhbuf));
-				log_warnx("ECMP v6 multipath: skip nh %s "
-				    "no F_BGPD flags=0x%04x",
-				    nhbuf, km6->flags);
+			if (!(km6->flags & F_BGPD))
 				continue;
-			}
 			if (off + nhlen > sizeof(mpbuf))
 				break;
 
@@ -2866,25 +2851,8 @@ add_multipath_attr(struct nlmsghdr *nlh, struct ktable *kt,
 				nh.aid = AID_INET6;
 				nh.v6 = km6->nexthop;
 				nhkr = kroute6_match(kt, &nh, 0);
-				if (nhkr != NULL) {
+				if (nhkr != NULL)
 					ifidx = nhkr->ifindex;
-					inet_ntop(AF_INET6, &km6->nexthop,
-					    nhbuf, sizeof(nhbuf));
-					log_warnx("ECMP v6 multipath: nh %s "
-					    "resolved ifindex=%u via match",
-					    nhbuf, ifidx);
-				} else {
-					inet_ntop(AF_INET6, &km6->nexthop,
-					    nhbuf, sizeof(nhbuf));
-					log_warnx("ECMP v6 multipath: nh %s "
-					    "NO match, ifindex stays 0",
-					    nhbuf);
-				}
-			} else {
-				inet_ntop(AF_INET6, &km6->nexthop, nhbuf,
-				    sizeof(nhbuf));
-				log_warnx("ECMP v6 multipath: nh %s "
-				    "has ifindex=%u", nhbuf, ifidx);
 			}
 
 			rtnh = (struct rtnexthop *)(mpbuf + off);
@@ -2902,8 +2870,6 @@ add_multipath_attr(struct nlmsghdr *nlh, struct ktable *kt,
 			off += nhlen;
 			nhops++;
 		}
-		log_warnx("ECMP v6 multipath: %s/%u total nhops=%d",
-		    log_addr(&kf->prefix), kf->prefixlen, nhops);
 		break;
 	}
 	default:
@@ -2974,12 +2940,7 @@ send_rtmsg(int action, struct ktable *kt, struct kroute_full *kf)
 	if (action != RTM_DELETE &&
 	    (kf->flags & F_ECMP) &&
 	    !(kf->flags & (F_BLACKHOLE|F_REJECT))) {
-		int mp = add_multipath_attr(nlh, kt, kf);
-		log_warnx("ECMP send_rtmsg: %s/%u aid=%d action=%d "
-		    "multipath_attr=%d",
-		    log_addr(&kf->prefix), kf->prefixlen,
-		    kf->prefix.aid, action, mp);
-		if (mp > 0)
+		if (add_multipath_attr(nlh, kt, kf) > 0)
 			goto skip_gw;
 	}
 	{
