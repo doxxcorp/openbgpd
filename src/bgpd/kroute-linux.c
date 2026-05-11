@@ -520,15 +520,19 @@ kr4_change(struct ktable *kt, struct kroute_full *kf)
 			kr->flags |= F_BGPD_INSERTED;
 	} else {
 		/*
-		 * Multipath to single-path transition: when the chain has
-		 * stale nexthops (kr->next != NULL) but the update is not
-		 * ECMP, delete the old multipath route from the kernel and
-		 * purge stale chain entries before installing the single
-		 * nexthop. The kernel won't replace a multipath route with
-		 * a single-nexthop route via NLM_F_REPLACE alone.
+		 * Single-path update for a prefix that may have been
+		 * multipath. If kr->next != NULL, stale chain entries
+		 * remain from a prior ECMP set. Delete the old multipath
+		 * route and purge the chain before installing the single
+		 * nexthop - the kernel won't replace multipath with
+		 * single-nexthop via NLM_F_REPLACE alone.
+		 *
+		 * F_ECMP may still be set here (sticky from
+		 * fib-multipath filter nhflags) even when the ECMP set
+		 * has shrunk to one; check kr->next unconditionally.
 		 */
 		int was_multipath = (kr->next != NULL);
-		if (was_multipath && !(kf->flags & F_ECMP)) {
+		if (was_multipath) {
 			struct kroute_full ekf;
 			struct kroute *stale, *snext;
 
@@ -621,7 +625,7 @@ kr6_change(struct ktable *kt, struct kroute_full *kf)
 			kr6->flags |= F_BGPD_INSERTED;
 	} else {
 		int was_multipath = (kr6->next != NULL);
-		if (was_multipath && !(kf->flags & F_ECMP)) {
+		if (was_multipath) {
 			struct kroute_full ekf;
 			struct kroute6 *stale, *snext;
 
