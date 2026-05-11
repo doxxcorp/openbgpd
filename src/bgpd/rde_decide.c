@@ -561,11 +561,6 @@ prefix_evaluate(struct rib_entry *re, struct prefix *new, struct prefix *old)
 	 * and added again then generate an update.
 	 */
 	if (oldbest != newbest || (old != NULL && newbest == old)) {
-		/*
-		 * Send update withdrawing oldbest and adding newbest
-		 * but remember that newbest may be NULL aka ineligible.
-		 * Additional decision may be made by the called functions.
-		 */
 		if ((rib->flags & F_RIB_NOFIB) == 0)
 			rde_send_kroute(rib, newbest, oldbest);
 		rde_generate_updates(re, new, old_pathid_tx, EVAL_DEFAULT);

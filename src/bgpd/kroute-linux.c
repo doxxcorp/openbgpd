@@ -2943,6 +2943,54 @@ send_rtmsg(int action, struct ktable *kt, struct kroute_full *kf)
 		if (add_multipath_attr(nlh, kt, kf) > 0)
 			goto skip_gw;
 	}
+	/*
+	 * IPv6 single-nexthop routes need RTNH_F_ONLINK via a
+	 * RTA_MULTIPATH attribute with one entry. Without onlink,
+	 * the kernel rejects the route install when a covering
+	 * route from another routing daemon exists in the FIB.
+	 * The ECMP path already handles this in add_multipath_attr.
+	 */
+	if (action != RTM_DELETE &&
+	    kf->prefix.aid == AID_INET6 &&
+	    kf->nexthop.aid != AID_UNSPEC &&
+	    !(kf->flags & (F_BLACKHOLE|F_REJECT))) {
+		char mpbuf[256];
+		struct rtnexthop *rtnh;
+		struct rtattr *rta;
+		size_t gwlen = sizeof(struct in6_addr);
+		size_t nhlen = RTNH_ALIGN(sizeof(struct rtnexthop)) +
+		    RTA_SPACE(gwlen);
+		u_short ifidx = kf->ifindex;
+
+		if (ifidx == 0) {
+			struct bgpd_addr nh;
+			struct kroute6 *nhkr;
+			memset(&nh, 0, sizeof(nh));
+			nh.aid = AID_INET6;
+			nh.v6 = kf->nexthop.v6;
+			nhkr = kroute6_match(kt, &nh, 1);
+			if (nhkr != NULL)
+				ifidx = nhkr->ifindex;
+		}
+
+		if (ifidx != 0) {
+			memset(mpbuf, 0, nhlen);
+			rtnh = (struct rtnexthop *)mpbuf;
+			rtnh->rtnh_len = nhlen;
+			rtnh->rtnh_flags = RTNH_F_ONLINK;
+			rtnh->rtnh_hops = 0;
+			rtnh->rtnh_ifindex = ifidx;
+
+			rta = (struct rtattr *)(mpbuf +
+			    RTNH_ALIGN(sizeof(struct rtnexthop)));
+			rta->rta_type = RTA_GATEWAY;
+			rta->rta_len = RTA_LENGTH(gwlen);
+			memcpy(RTA_DATA(rta), &kf->nexthop.v6, gwlen);
+
+			mnl_attr_put(nlh, RTA_MULTIPATH, nhlen, mpbuf);
+			goto skip_gw;
+		}
+	}
 	{
 		switch (kf->prefix.aid) {
 		case AID_INET:
