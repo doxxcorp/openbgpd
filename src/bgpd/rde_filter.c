@@ -206,7 +206,6 @@ rde_apply_set(const struct rde_filter_set *rfs, struct rde_peer *peer,
 			break;
 		case ACTION_SET_ECMP:
 			state->nhflags |= NEXTHOP_ECMP;
-			log_warnx("fib-multipath: set NEXTHOP_ECMP nhflags=0x%02x", state->nhflags);
 			break;
 		}
 	}
