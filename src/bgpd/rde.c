@@ -4124,8 +4124,11 @@ rde_reload_done(void)
 			reload++;
 			break;
 		case RECONF_REINIT:
-			/* new rib */
+			/* new rib - needs FIB sync after softreconfig */
 			rib->state = RECONF_RELOAD;
+			if ((rib->flags & (F_RIB_NOFIB | F_RIB_NOEVALUATE))
+			    == 0)
+				rib->fibstate = RECONF_RELOAD;
 			reload++;
 			break;
 		case RECONF_NONE:
