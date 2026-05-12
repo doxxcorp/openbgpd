@@ -177,6 +177,7 @@ void		 kroute_detach_nexthop(struct ktable *, struct knexthop *);
 uint8_t		prefixlen_classful(in_addr_t);
 static uint8_t	mask2prefixlen4(struct sockaddr_in *);
 static uint8_t	mask2prefixlen6(struct sockaddr_in6 *);
+static u_short	resolve_v6_ifindex(struct in6_addr *);
 #ifdef NOTYET
 uint64_t	ift2ifm(uint8_t);
 const char	*get_media_descr(uint64_t);
@@ -2899,6 +2900,8 @@ add_multipath_attr(struct nlmsghdr *nlh, struct ktable *kt,
 				if (nhkr != NULL)
 					ifidx = nhkr->ifindex;
 			}
+			if (ifidx == 0)
+				ifidx = resolve_v6_ifindex(&km6->nexthop);
 
 			rtnh = (struct rtnexthop *)(mpbuf + off);
 			rtnh->rtnh_len = nhlen;
@@ -2927,6 +2930,60 @@ add_multipath_attr(struct nlmsghdr *nlh, struct ktable *kt,
 		nhops = 0;
 
 	return (nhops);
+}
+
+/*
+ * Resolve the output interface index for an IPv6 nexthop by asking
+ * the kernel via RTM_GETROUTE.  Returns the ifindex or 0 on failure.
+ * This is needed when the covering route for the nexthop is managed
+ * by a different routing daemon (e.g. mesh bgpd) and thus absent
+ * from inet-bgpd's internal kroute tree.
+ */
+static u_short
+resolve_v6_ifindex(struct in6_addr *nexthop)
+{
+	char buf[MNL_SOCKET_BUFFER_SIZE];
+	struct nlmsghdr *nlh;
+	struct rtmsg *rtm;
+	struct mnl_socket *nl;
+	ssize_t len;
+	u_short ifidx = 0;
+
+	nlh = mnl_nlmsg_put_header(buf);
+	nlh->nlmsg_type = RTM_GETROUTE;
+	nlh->nlmsg_flags = NLM_F_REQUEST;
+	nlh->nlmsg_seq = 0;
+
+	rtm = mnl_nlmsg_put_extra_header(nlh, sizeof(struct rtmsg));
+	rtm->rtm_family = AF_INET6;
+	rtm->rtm_dst_len = 128;
+
+	mnl_attr_put(nlh, RTA_DST, sizeof(struct in6_addr), nexthop);
+
+	nl = mnl_socket_open(NETLINK_ROUTE);
+	if (nl == NULL)
+		return (0);
+	if (mnl_socket_bind(nl, 0, MNL_SOCKET_AUTOPID) < 0) {
+		mnl_socket_close(nl);
+		return (0);
+	}
+	if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0) {
+		mnl_socket_close(nl);
+		return (0);
+	}
+	len = mnl_socket_recvfrom(nl, buf, sizeof(buf));
+	if (len > 0) {
+		struct nlattr *attr;
+		nlh = (struct nlmsghdr *)buf;
+		mnl_attr_for_each(attr, nlh, sizeof(struct rtmsg)) {
+			if (mnl_attr_get_type(attr) == RTA_OIF) {
+				ifidx = mnl_attr_get_u32(attr);
+				break;
+			}
+		}
+	}
+	mnl_socket_close(nl);
+	return (ifidx);
 }
 
 int
@@ -3017,6 +3074,8 @@ send_rtmsg(int action, struct ktable *kt, struct kroute_full *kf)
 			if (nhkr != NULL)
 				ifidx = nhkr->ifindex;
 		}
+		if (ifidx == 0)
+			ifidx = resolve_v6_ifindex(&kf->nexthop.v6);
 
 		if (ifidx != 0) {
 			memset(mpbuf, 0, nhlen);
