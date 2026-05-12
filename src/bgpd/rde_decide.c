@@ -584,8 +584,16 @@ prefix_evaluate(struct rib_entry *re, struct prefix *new, struct prefix *old)
 		if (ecmp && ep != NULL &&
 		    ep->dmetric == PREFIX_DMETRIC_ECMP)
 			rde_send_kroute(rib, newbest, NULL);
-		else if (old != NULL)
+		else if (old != NULL) {
+			/*
+			 * ECMP sibling withdrawn: send a DELETE for the
+			 * old nexthop so kr_delete -> kroute_remove can
+			 * purge it from the multipath chain, then resend
+			 * the remaining best as a CHANGE.
+			 */
+			rde_send_kroute(rib, NULL, old);
 			rde_send_kroute(rib, newbest, NULL);
+		}
 	}
 
 	/*
