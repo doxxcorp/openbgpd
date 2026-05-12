@@ -5,6 +5,7 @@
  * Copyright (c) 2016 Job Snijders <job@instituut.net>
  * Copyright (c) 2016 Peter Hessler <phessler@openbsd.org>
  * Copyright (c) 2018 Sebastian Benoit <benno@openbsd.org>
+ * Copyright (c) 2026 Barrett Lyon <blyon@doxx.net>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -3575,6 +3576,15 @@ rde_send_kroute(struct rib *rib, struct prefix *new, struct prefix *old)
 			kf.flags |= F_REJECT;
 		if (prefix_nhflags(p) == NEXTHOP_BLACKHOLE)
 			kf.flags |= F_BLACKHOLE;
+		/*
+		 * Only mark F_ECMP when an actual ECMP sibling is
+		 * present in the RIB, not just because the filter set
+		 * NEXTHOP_ECMP on this prefix.  Without this check
+		 * the kroute process receives F_ECMP after the last
+		 * sibling is withdrawn and never purges the stale
+		 * multipath nexthop from the kernel FIB.
+		 * blyon@doxx.net
+		 */
 		if (prefix_nhflags(p) & NEXTHOP_ECMP) {
 			struct prefix *ep;
 			ep = TAILQ_NEXT(p, rib_l);

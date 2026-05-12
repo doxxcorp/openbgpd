@@ -3,6 +3,7 @@
 /*
  * Copyright (c) 2003, 2004 Claudio Jeker <claudio@openbsd.org>
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
+ * Copyright (c) 2026 Barrett Lyon <blyon@doxx.net>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -583,16 +584,25 @@ prefix_evaluate(struct rib_entry *re, struct prefix *new, struct prefix *old)
 			ecmp = 1;
 		if (ecmp && ep != NULL &&
 		    ep->dmetric == PREFIX_DMETRIC_ECMP) {
+			/*
+			 * Send the new sibling to the kroute process
+			 * first so it gets chained onto the multipath
+			 * list before we resend the best.  Without
+			 * this the kroute chain never learns about
+			 * new ECMP nexthops and add_multipath_attr
+			 * only sees a single entry.
+			 * blyon@doxx.net
+			 */
 			if (new != NULL && new != newbest)
 				rde_send_kroute(rib, new, NULL);
 			rde_send_kroute(rib, newbest, NULL);
-		}
-		else if (old != NULL) {
+		} else if (old != NULL) {
 			/*
-			 * ECMP sibling withdrawn: send a DELETE for the
-			 * old nexthop so kr_delete -> kroute_remove can
-			 * purge it from the multipath chain, then resend
-			 * the remaining best as a CHANGE.
+			 * ECMP sibling withdrawn: delete the old
+			 * nexthop so kroute_remove purges it from
+			 * the multipath chain, then resend the
+			 * remaining best as a single-path CHANGE.
+			 * blyon@doxx.net
 			 */
 			rde_send_kroute(rib, NULL, old);
 			rde_send_kroute(rib, newbest, NULL);

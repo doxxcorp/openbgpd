@@ -4,6 +4,7 @@
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
  * Copyright (c) 2022 Claudio Jeker <claudio@openbsd.org>
  * Copyright (c) 2021 Ariadne Conill <ariadne@dereferenced.org>
+ * Copyright (c) 2026 Barrett Lyon <blyon@doxx.net>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -513,20 +514,22 @@ kr4_change(struct ktable *kt, struct kroute_full *kf)
 			krn->flags |= F_BGPD_INSERTED;
 	} else if ((kf->flags & F_ECMP) && kr->next != NULL) {
 		/*
-		 * ECMP: matchgw found this nexthop already in the chain
-		 * and there are other chain entries. Resend the full
-		 * multipath route to the kernel.
+		 * ECMP resend: this nexthop is already in the chain
+		 * and siblings exist.  Reinstall the full multipath
+		 * set via add_multipath_attr.
 		 */
 		if (send_rtmsg(RTM_CHANGE, kt, kf))
 			kr->flags |= F_BGPD_INSERTED;
 	} else {
 		/*
-		 * Non-ECMP update, or ECMP but this is the only nexthop.
-		 * If kr->next != NULL, stale chain entries remain from a
-		 * prior ECMP set that has shrunk. Delete the old multipath
-		 * route, purge the chain, and reinstall with just this
-		 * nexthop. The kernel won't replace multipath with
-		 * single-nexthop via NLM_F_REPLACE alone.
+		 * Non-ECMP update or last remaining ECMP nexthop.
+		 * When kr->next is set the ECMP set has shrunk and
+		 * stale chain entries need to go.  Linux will not
+		 * replace a multipath route with a single-nexthop
+		 * route via NLM_F_REPLACE, so we delete the whole
+		 * route, purge the chain, then reinstall with
+		 * RTM_ADD.
+		 * blyon@doxx.net
 		 */
 		int was_multipath = (kr->next != NULL);
 		if (was_multipath) {
@@ -2931,9 +2934,13 @@ add_multipath_attr(struct nlmsghdr *nlh, struct ktable *kt,
 /*
  * Resolve the output interface index for an IPv6 nexthop by asking
  * the kernel via RTM_GETROUTE.  Returns the ifindex or 0 on failure.
- * This is needed when the covering route for the nexthop is managed
- * by a different routing daemon (e.g. mesh bgpd) and thus absent
- * from inet-bgpd's internal kroute tree.
+ *
+ * The covering route for an iBGP nexthop may not exist in the local
+ * kroute tree when it is managed by another routing process.
+ * Without a valid ifindex the kernel rejects RTNH_F_ONLINK and the
+ * route silently disappears during a multipath-to-single transition.
+ * Querying the kernel directly is the only reliable fallback.
+ * blyon@doxx.net
  */
 static u_short
 resolve_v6_ifindex(struct in6_addr *nexthop)
