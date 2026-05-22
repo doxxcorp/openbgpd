@@ -1,4 +1,4 @@
-/*	$OpenBSD: bgpd.h,v 1.541 2026/05/07 18:56:38 claudio Exp $ */
+/*	$OpenBSD: bgpd.h,v 1.543 2026/05/18 18:36:25 claudio Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -54,6 +54,7 @@
 #define	MAX_RTSOCK_BUF			(2 * 1024 * 1024)
 #define	MAX_COMM_MATCH			3
 #define	MAX_ASPA_SPAS_COUNT		10000
+#define	MAX_ADDPATH_COUNT		100
 #define	MIN_HOLDTIME			3
 
 #define	BGPD_OPT_VERBOSE		0x0001
@@ -95,7 +96,7 @@
 #define	F_REJECT		0x0020
 #define	F_BLACKHOLE		0x0040
 #define	F_MPLS			0x0080
-#define	F_ECMP			0x0100	/* install ECMP multipath in FIB */
+#define	F_ECMP			0x0100
 #define	F_LONGER		0x0200
 #define	F_SHORTER		0x0400
 #define	F_CTL_DETAIL		0x1000		/* only set on requests */
@@ -604,6 +605,7 @@ struct flowspec {
 	uint8_t			data[1];
 };
 #define FLOWSPEC_SIZE	(offsetof(struct flowspec, data))
+#define FLOWSPEC_SIZE_MAX	4000
 
 struct flowspec_config {
 	RB_ENTRY(flowspec_config)	 entry;
@@ -1313,8 +1315,7 @@ enum action_types {
 	ACTION_SET_COMMUNITY,
 	ACTION_PFTABLE,
 	ACTION_RTLABEL,
-	ACTION_SET_ORIGIN,
-	ACTION_SET_ECMP
+	ACTION_SET_ORIGIN
 };
 
 struct filter_set {
