@@ -37,7 +37,7 @@ jobs:
           sha256sum bgpd-linux-amd64 bgpctl-linux-amd64 > checksums.txt
 
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             bgpd-linux-amd64
