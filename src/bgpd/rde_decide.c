@@ -582,11 +582,8 @@ prefix_evaluate(struct rib_entry *re, struct prefix *new, struct prefix *old)
 		    (prefix_nhflags(ep) & NEXTHOP_ECMP))
 			ecmp = 1;
 		if (ecmp && ep != NULL &&
-		    ep->dmetric == PREFIX_DMETRIC_ECMP) {
-			if (new != NULL && new != newbest)
-				rde_send_kroute(rib, new, NULL);
+		    ep->dmetric == PREFIX_DMETRIC_ECMP)
 			rde_send_kroute(rib, newbest, NULL);
-		}
 		else if (old != NULL) {
 			/*
 			 * ECMP sibling withdrawn: send a DELETE for the

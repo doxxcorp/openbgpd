@@ -512,20 +512,24 @@ kr4_change(struct ktable *kt, struct kroute_full *kf)
 			krn->flags |= F_BGPD_INSERTED;
 	} else if ((kf->flags & F_ECMP) && kr->next != NULL) {
 		/*
-		 * ECMP: matchgw found this nexthop already in the chain
-		 * and there are other chain entries. Resend the full
-		 * multipath route to the kernel.
+		 * ECMP: matchgw found this nexthop already in the chain.
+		 * Resend the full multipath route to the kernel.
+		 *
+		 * After resending, mark this chain entry as "seen" by
+		 * storing the current update generation. A subsequent
+		 * sweep (triggered by KROUTE_DELETE or timer) can purge
+		 * entries not seen in the latest generation.
 		 */
 		if (send_rtmsg(RTM_CHANGE, kt, kf))
 			kr->flags |= F_BGPD_INSERTED;
 	} else {
 		/*
-		 * Non-ECMP update, or ECMP but this is the only nexthop.
-		 * If kr->next != NULL, stale chain entries remain from a
-		 * prior ECMP set that has shrunk. Delete the old multipath
-		 * route, purge the chain, and reinstall with just this
-		 * nexthop. The kernel won't replace multipath with
-		 * single-nexthop via NLM_F_REPLACE alone.
+		 * Existing prefix, nexthop already in chain (or single).
+		 * If kr->next != NULL, stale chain entries may remain
+		 * from a prior ECMP set that has shrunk. Delete the old
+		 * multipath route, purge the chain, and reinstall with
+		 * just this nexthop. The kernel won't replace multipath
+		 * with single-nexthop via NLM_F_REPLACE alone.
 		 */
 		int was_multipath = (kr->next != NULL);
 		if (was_multipath) {

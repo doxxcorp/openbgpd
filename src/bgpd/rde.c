@@ -3575,13 +3575,9 @@ rde_send_kroute(struct rib *rib, struct prefix *new, struct prefix *old)
 			kf.flags |= F_REJECT;
 		if (prefix_nhflags(p) == NEXTHOP_BLACKHOLE)
 			kf.flags |= F_BLACKHOLE;
-		if (prefix_nhflags(p) & NEXTHOP_ECMP) {
-			struct prefix *ep;
-			ep = TAILQ_NEXT(p, rib_l);
-			if (ep != NULL &&
-			    ep->dmetric == PREFIX_DMETRIC_ECMP)
-				kf.flags |= F_ECMP;
-		} else {
+		if (prefix_nhflags(p) & NEXTHOP_ECMP)
+			kf.flags |= F_ECMP;
+		if (!(kf.flags & F_ECMP)) {
 			struct prefix *ep;
 			ep = TAILQ_NEXT(p, rib_l);
 			if (ep != NULL &&
