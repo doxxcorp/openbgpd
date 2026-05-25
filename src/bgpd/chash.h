@@ -1,4 +1,4 @@
-/*	$OpenBSD: chash.h,v 1.8 2026/05/18 12:34:51 claudio Exp $	*/
+/*	$OpenBSD: chash.h,v 1.6 2026/03/17 09:29:29 claudio Exp $	*/
 /*
  * Copyright (c) 2025 Claudio Jeker <claudio@openbsd.org>
  * Copyright (c) 2016 David Gwynne <dlg@openbsd.org>
@@ -48,12 +48,14 @@ struct ch_type {
 	struct ch_counts *t_counts;
 };
 
-struct ch_ext;
+struct ch_group;
+struct ch_meta;
 
 struct ch_table {
-	struct ch_ext		*ch_exts;
-	uint32_t		 ch_level;
-	struct ch_counts	 ch_counts;
+	struct ch_group		**ch_tables;
+	struct ch_meta		**ch_metas;
+	uint32_t		  ch_level;
+	struct ch_counts	  ch_counts;
 };
 
 
@@ -76,7 +78,7 @@ void *_ch_remove(const struct ch_type *, struct ch_table *, uint64_t,
 void *_ch_find(const struct ch_type *, struct ch_table *, uint64_t,
 	    const void *);
 void *_ch_locate(const struct ch_type *, struct ch_table *, uint64_t,
-	    int (*)(const void *, const void *), const void *);
+	    int (*)(const void *, void *), void *);
 void *_ch_first(const struct ch_type *, struct ch_table *, struct ch_iter *);
 void *_ch_next(const struct ch_type *, struct ch_table *, struct ch_iter *);
 void  _ch_get_stats(struct ch_stats *, const struct ch_counts *);
@@ -132,10 +134,10 @@ _name##_CH_FIND(struct _name *head, const struct _type *key)		\
 									\
 __unused static inline struct _type *					\
 _name##_CH_LOCATE(struct _name *head, uint64_t hash, 			\
-    int (*eq)(const void *, const void *), const void *arg)		\
+    int (*cmp)(const void *, void *), void *arg)			\
 {									\
 	return _ch_locate(_name##_CH_TYPE, &head->ch_table, hash,	\
-	    eq, arg);							\
+	    cmp, arg);							\
 }									\
 									\
 __unused static inline struct _type *					\
@@ -193,8 +195,8 @@ const struct ch_type *const _name##_CH_TYPE = &_name##_CH_INFO
 					_name##_CH_INSERT(_head, _elm, _prev)
 #define CH_REMOVE(_name, _head, _elm)	_name##_CH_REMOVE(_head, _elm)
 #define CH_FIND(_name, _head, _key)	_name##_CH_FIND(_head, _key)
-#define CH_LOCATE(_name, _head, _h, _eq, _a)			\
-					_name##_CH_LOCATE(_head, _h, _eq, _a)
+#define CH_LOCATE(_name, _head, _h, _cmp, _a)			\
+					_name##_CH_LOCATE(_head, _h, _cmp, _a)
 #define CH_FIRST(_name, _head, _iter)	_name##_CH_FIRST(_head, _iter)
 #define CH_NEXT(_name, _head, _iter)	_name##_CH_NEXT(_head, _iter)
 #define CH_STATS(_name, _head, _stats)	_name##_CH_STATS(_head, _stats)

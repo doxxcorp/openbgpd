@@ -1,4 +1,4 @@
-/*	$OpenBSD: rde_update.c,v 1.196 2026/05/20 18:33:21 claudio Exp $ */
+/*	$OpenBSD: rde_update.c,v 1.194 2026/05/07 20:35:19 claudio Exp $ */
 
 /*
  * Copyright (c) 2004 Claudio Jeker <claudio@openbsd.org>
@@ -159,7 +159,7 @@ up_enforce_open_policy(struct rde_peer *peer, struct filterstate *state,
  */
 static enum up_state
 up_process_prefix(struct rde_peer *peer, struct prefix *new,
-    struct adjout_prefix *p, int force_update)
+    struct adjout_prefix *p)
 {
 	struct filterstate state;
 	struct bgpd_addr addr;
@@ -201,8 +201,7 @@ up_process_prefix(struct rde_peer *peer, struct prefix *new,
 	}
 
 	up_prep_adjout(peer, &state, new->pt->aid);
-	adjout_prefix_update(p, peer, &state, new->pt, path_id_tx,
-	    force_update);
+	adjout_prefix_update(p, peer, &state, new->pt, path_id_tx);
 	rde_filterstate_clean(&state);
 
 	/* max prefix checker outbound */
@@ -220,8 +219,7 @@ up_process_prefix(struct rde_peer *peer, struct prefix *new,
 }
 
 void
-up_generate_updates(struct rde_peer *peer, struct rib_entry *re,
-    int force_update)
+up_generate_updates(struct rde_peer *peer, struct rib_entry *re)
 {
 	struct prefix		*new;
 	struct adjout_prefix	*p;
@@ -230,7 +228,7 @@ up_generate_updates(struct rde_peer *peer, struct rib_entry *re,
 
 	new = prefix_best(re);
 	while (new != NULL) {
-		switch (up_process_prefix(peer, new, p, force_update)) {
+		switch (up_process_prefix(peer, new, p)) {
 		case UP_OK:
 		case UP_ERR_LIMIT:
 			return;
@@ -260,8 +258,7 @@ done:
  * less churn is needed.
  */
 void
-up_generate_addpath(struct rde_peer *peer, struct rib_entry *re,
-    int force_update)
+up_generate_addpath(struct rde_peer *peer, struct rib_entry *re)
 {
 	struct prefix		*new;
 	struct adjout_prefix	*head, *p;
@@ -281,6 +278,14 @@ up_generate_addpath(struct rde_peer *peer, struct rib_entry *re,
 	/* update paths */
 	new = prefix_best(re);
 	while (new != NULL) {
+		/* check limits and stop when a limit is reached */
+		if (peer->eval.maxpaths != 0 &&
+		    maxpaths >= peer->eval.maxpaths)
+			break;
+		if (peer->eval.extrapaths != 0 &&
+		    extrapaths >= peer->eval.extrapaths)
+			break;
+
 		extra = 1;
 		if (checkmode) {
 			switch (peer->eval.mode) {
@@ -306,23 +311,15 @@ up_generate_addpath(struct rde_peer *peer, struct rib_entry *re,
 					checkmode = 0;
 				break;
 			case ADDPATH_EVAL_ALL:
-				/* no extra paths */
-				extra = 0;
+				/* nothing to check */
+				checkmode = 0;
 				break;
 			default:
 				fatalx("unknown add-path eval mode");
 			}
 		}
 
-		/* check limits and stop when a limit is reached */
-		if (peer->eval.maxpaths != 0 &&
-		    maxpaths >= peer->eval.maxpaths)
-			break;
-		if (extra != 0 && extrapaths >= peer->eval.extrapaths)
-			break;
-
-		switch (up_process_prefix(peer, new, (void *)-1,
-		    force_update)) {
+		switch (up_process_prefix(peer, new, (void *)-1)) {
 		case UP_OK:
 			maxpaths++;
 			extrapaths += extra;
@@ -364,7 +361,7 @@ up_generate_addpath(struct rde_peer *peer, struct rib_entry *re,
  */
 void
 up_generate_addpath_all(struct rde_peer *peer, struct rib_entry *re,
-    struct prefix *new, uint32_t old_pathid_tx, int force_update)
+    struct prefix *new, uint32_t old_pathid_tx)
 {
 	struct adjout_prefix	*p;
 
@@ -373,7 +370,7 @@ up_generate_addpath_all(struct rde_peer *peer, struct rib_entry *re,
 	 * use up_generate_addpath() for that.
 	 */
 	if (old_pathid_tx == 0 && new == NULL) {
-		up_generate_addpath(peer, re, force_update);
+		up_generate_addpath(peer, re);
 		return;
 	}
 
@@ -384,8 +381,7 @@ up_generate_addpath_all(struct rde_peer *peer, struct rib_entry *re,
 
 	if (new != NULL) {
 		/* add new path */
-		switch (up_process_prefix(peer, new, (void *)-1,
-		    force_update)) {
+		switch (up_process_prefix(peer, new, (void *)-1)) {
 		case UP_OK:
 			/* don't remove old if an existing prefix was updated */
 			if (old_pathid_tx == new->path_id_tx)
@@ -408,7 +404,7 @@ up_generate_addpath_all(struct rde_peer *peer, struct rib_entry *re,
 	}
 }
 
-/* send a default route to the specified peer, always force the update out */
+/* send a default route to the specified peer */
 void
 up_generate_default(struct rde_peer *peer, uint8_t aid)
 {
@@ -451,7 +447,7 @@ up_generate_default(struct rde_peer *peer, uint8_t aid)
 	if (pte == NULL)
 		pte = pt_add(&addr, 0);
 	p = adjout_prefix_first(peer, pte);
-	adjout_prefix_update(p, peer, &state, pte, 0, 1);
+	adjout_prefix_update(p, peer, &state, pte, 0);
 	rde_filterstate_clean(&state);
 
 	/* max prefix checker outbound */

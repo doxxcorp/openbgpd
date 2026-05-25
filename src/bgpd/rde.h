@@ -1,4 +1,4 @@
-/*	$OpenBSD: rde.h,v 1.351 2026/05/21 15:20:27 claudio Exp $ */
+/*	$OpenBSD: rde.h,v 1.347 2026/05/07 11:21:24 claudio Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Claudio Jeker <claudio@openbsd.org> and
@@ -317,7 +317,8 @@ struct prefix {
 #define	NEXTHOP_REJECT		0x02
 #define	NEXTHOP_BLACKHOLE	0x04
 #define	NEXTHOP_NOMODIFY	0x08
-#define	NEXTHOP_MASK		0x0f
+#define	NEXTHOP_ECMP		0x10
+#define	NEXTHOP_MASK		0x1f
 #define	NEXTHOP_VALID		0x80
 
 struct adjout_attr {
@@ -420,7 +421,7 @@ struct rde_peer	*peer_add(uint32_t, struct peer_config *, struct filter_head *);
 struct rde_filter	*peer_apply_out_filter(struct rde_peer *,
 			    struct filter_head *);
 
-void		 rde_enqueue_updates(struct rib_entry *, struct prefix *,
+void		 rde_generate_updates(struct rib_entry *, struct prefix *,
 		    uint32_t, enum eval_mode);
 void		 peer_process_updates(struct rde_peer *, void *);
 
@@ -451,7 +452,7 @@ int		 attr_writebuf(struct ibuf *, uint8_t, uint8_t, const void *,
 		    uint16_t);
 void		 attr_init(void);
 int		 attr_optadd(struct rde_aspath *, uint8_t, uint8_t,
-		    const void *, uint16_t);
+		    void *, uint16_t);
 struct attr	*attr_optget(const struct rde_aspath *, uint8_t);
 void		 attr_copy(struct rde_aspath *, const struct rde_aspath *);
 int		 attr_equal(const struct rde_aspath *,
@@ -582,10 +583,10 @@ void	 pt_init(void);
 void	 pt_shutdown(void);
 void	 pt_getaddr(struct pt_entry *, struct bgpd_addr *);
 int	 pt_getflowspec(struct pt_entry *, uint8_t **);
-struct pt_entry	*pt_fill(struct bgpd_addr *, u_int);
-struct pt_entry	*pt_get(struct bgpd_addr *, u_int);
-struct pt_entry	*pt_get_next(struct bgpd_addr *, u_int);
-struct pt_entry	*pt_add(struct bgpd_addr *, u_int);
+struct pt_entry	*pt_fill(struct bgpd_addr *, int);
+struct pt_entry	*pt_get(struct bgpd_addr *, int);
+struct pt_entry	*pt_get_next(struct bgpd_addr *, int);
+struct pt_entry	*pt_add(struct bgpd_addr *, int);
 struct pt_entry	*pt_get_flow(struct flowspec *);
 struct pt_entry	*pt_add_flow(struct flowspec *);
 struct pt_entry	*pt_first(uint8_t);
@@ -773,7 +774,7 @@ struct adjout_prefix	*adjout_prefix_next(struct rde_peer *,
 			    struct pt_entry *, struct adjout_prefix *);
 
 void		 adjout_prefix_update(struct adjout_prefix *, struct rde_peer *,
-		    struct filterstate *, struct pt_entry *, uint32_t, int);
+		    struct filterstate *, struct pt_entry *, uint32_t);
 void		 adjout_prefix_withdraw(struct rde_peer *, struct pt_entry *,
 		    struct adjout_prefix *);
 void		 adjout_prefix_reaper(struct rde_peer *);
@@ -805,14 +806,15 @@ void		 pend_prefix_stats(struct ch_stats *);
 void		 adjout_attr_stats(struct ch_stats *);
 
 /* rde_update.c */
-void	 up_generate_updates(struct rde_peer *, struct rib_entry *, int);
-void	 up_generate_addpath(struct rde_peer *, struct rib_entry *, int);
-void	 up_generate_addpath_all(struct rde_peer *, struct rib_entry *,
-	    struct prefix *, uint32_t, int);
-void	 up_generate_default(struct rde_peer *, uint8_t);
-int	 up_is_eor(struct rde_peer *, uint8_t);
-void	 up_dump_withdraws(struct imsgbuf *, struct rde_peer *, uint8_t);
-void	 up_dump_update(struct imsgbuf *, struct rde_peer *, uint8_t);
+void		 up_generate_updates(struct rde_peer *, struct rib_entry *);
+void		 up_generate_addpath(struct rde_peer *, struct rib_entry *);
+void		 up_generate_addpath_all(struct rde_peer *, struct rib_entry *,
+		    struct prefix *, uint32_t);
+void		 up_generate_default(struct rde_peer *, uint8_t);
+int		 up_is_eor(struct rde_peer *, uint8_t);
+void		 up_dump_withdraws(struct imsgbuf *, struct rde_peer *,
+		    uint8_t);
+void		 up_dump_update(struct imsgbuf *, struct rde_peer *, uint8_t);
 
 /* rde_aspa.c */
 void		 aspa_validation(struct rde_aspa *, struct aspath *,

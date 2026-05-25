@@ -204,6 +204,9 @@ rde_apply_set(const struct rde_filter_set *rfs, struct rde_peer *peer,
 		case ACTION_SET_ORIGIN:
 			state->aspath.origin = set->action.origin;
 			break;
+		case ACTION_SET_ECMP:
+			state->nhflags |= NEXTHOP_ECMP;
+			break;
 		}
 	}
 }
@@ -716,6 +719,8 @@ filterset_name(enum action_types type)
 		return ("rtlabel");
 	case ACTION_SET_ORIGIN:
 		return ("origin");
+	case ACTION_SET_ECMP:
+		return ("fib-multipath");
 	}
 
 	fatalx("filterset_name: got lost");

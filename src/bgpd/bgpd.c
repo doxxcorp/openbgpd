@@ -1,4 +1,4 @@
-/*	$OpenBSD: bgpd.c,v 1.290 2026/05/14 12:26:44 claudio Exp $ */
+/*	$OpenBSD: bgpd.c,v 1.288 2026/03/19 12:44:22 claudio Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -865,8 +865,10 @@ dispatch_imsg(struct imsgbuf *imsgbuf, int idx, struct bgpd_config *conf)
 				log_warnx("route request not from RDE");
 			else if (imsg_get_data(&imsg, &kf, sizeof(kf)) == -1)
 				log_warn("wrong imsg len");
-			else if (kr_change(imsg_get_id(&imsg), &kf))
-				rv = -1;
+			else {
+				if (kr_change(imsg_get_id(&imsg), &kf))
+					rv = -1;
+			}
 			break;
 		case IMSG_KROUTE_DELETE:
 			if (idx != PFD_PIPE_RDE)
@@ -1373,15 +1375,12 @@ bgpd_rtr_conn_setup(struct rtr_config *r)
 		log_warn("rtr %s", r->descr);
 		return;
 	}
-	ce->fd = -1;
-	ce->id = r->id;
 
 	if (pfkey_establish(&ce->auth_state, &r->auth,
-	    &r->local_addr, &r->remote_addr) == -1) {
+	    &r->local_addr, &r->remote_addr) == -1)
 		log_warnx("rtr %s: pfkey setup failed", r->descr);
-		goto fail;
-	}
 
+	ce->id = r->id;
 	ce->fd = socket(aid2af(r->remote_addr.aid),
 	    SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, IPPROTO_TCP);
 	if (ce->fd == -1) {
@@ -1412,10 +1411,8 @@ bgpd_rtr_conn_setup(struct rtr_config *r)
 		goto fail;
 	}
 
-	if (tcp_md5_set(ce->fd, &r->auth, &r->remote_addr) == -1) {
+	if (tcp_md5_set(ce->fd, &r->auth, &r->remote_addr) == -1)
 		log_warn("rtr %s: setting md5sig", r->descr);
-		goto fail;
-	}
 
 	if ((sa = addr2sa(&r->local_addr, 0, &len)) != NULL) {
 		if (bind(ce->fd, sa, len) == -1) {
@@ -1444,7 +1441,6 @@ bgpd_rtr_conn_setup(struct rtr_config *r)
  fail:
 	if (ce->fd != -1)
 		close(ce->fd);
-	pfkey_remove(&ce->auth_state);
 	free(ce);
 }
 
@@ -1494,7 +1490,6 @@ bgpd_rtr_conn_setup_done(int fd, struct bgpd_config *conf)
 
 fail:
 	close(fd);
-	pfkey_remove(&ce->auth_state);
 	free(ce);
 }
 

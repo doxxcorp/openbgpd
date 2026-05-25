@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.500 2026/05/19 12:23:41 claudio Exp $ */
+/*	$OpenBSD: parse.y,v 1.492 2026/05/08 12:03:50 tb Exp $ */
 
 /*
  * Copyright (c) 2002, 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -430,8 +430,8 @@ yesno		: STRING			{
 varset		: STRING '=' string		{
 			char *s = $1;
 			if (strlen($1) >= MACRO_NAME_LEN) {
-				yyerror("macro name too long, "
-				    "max %d characters", MACRO_NAME_LEN - 1);
+				yyerror("macro name to long, max %d characters",
+				    MACRO_NAME_LEN - 1);
 				free($1);
 				free($3);
 				YYERROR;
@@ -1201,6 +1201,7 @@ flowspec	: FLOWSPEC af {
 
 			f = flow_to_flowspec(curflow);
 			if (f == NULL) {
+				yyerror("out of memory");
 				free($5);
 				flow_free(curflow);
 				curflow = NULL;
@@ -1220,11 +1221,7 @@ flowspec	: FLOWSPEC af {
 		}
 		;
 
-proto		: PROTO proto_item {
-			curflow->type = FLOWSPEC_TYPE_PROTO;
-			if (push_unary_numop(OP_EQ, $2) == -1)
-				YYERROR;
-		}
+proto		: PROTO proto_item
 		| PROTO '{' optnl proto_list optnl '}'
 		;
 
@@ -1340,11 +1337,11 @@ flowrule	: from
 		} flags
 		| FRAGMENT {
 			curflow->type = FLOWSPEC_TYPE_FRAG;
-		} flags
+		} flags;
 		| icmpspec
-		| LENGTH {
+		| LENGTH lengthspec {
 			curflow->type = FLOWSPEC_TYPE_PKT_LEN;
-		} lengthspec
+		}
 		| proto
 		| TOS tos {
 			curflow->type = FLOWSPEC_TYPE_DSCP;
@@ -1476,7 +1473,7 @@ tos		: STRING		{
 			free($1);
 		}
 		| NUMBER		{
-			if ($1 < 0 || $1 > 255) {
+			if ($$ < 0 || $$ > 255) {
 				yyerror("illegal tos value %lld", $1);
 				YYERROR;
 			}
@@ -1507,7 +1504,7 @@ length_item	: length			{
 		;
 
 length		: NUMBER			{
-			if ($1 < 0 || $1 > USHRT_MAX) {
+			if ($$ < 0 || $$ > USHRT_MAX) {
 				yyerror("illegal ptk length value %lld", $1);
 				YYERROR;
 			}
@@ -1804,9 +1801,9 @@ groupopts_l	: /* empty */
 
 addpathextra	: /* empty */		{ $$ = 0; }
 		| PLUS NUMBER		{
-			if ($2 < 1 || $2 > MAX_ADDPATH_COUNT) {
+			if ($2 < 1 || $2 > USHRT_MAX) {
 				yyerror("additional paths must be between "
-				    "%u and %u", 1, MAX_ADDPATH_COUNT);
+				    "%u and %u", 1, USHRT_MAX);
 				YYERROR;
 			}
 			$$ = $2;
@@ -1815,9 +1812,9 @@ addpathextra	: /* empty */		{ $$ = 0; }
 
 addpathmax	: /* empty */		{ $$ = 0; }
 		| MAX NUMBER		{
-			if ($2 < 1 || $2 > MAX_ADDPATH_COUNT) {
+			if ($2 < 1 || $2 > USHRT_MAX) {
 				yyerror("maximum additional paths must be "
-				    "between %u and %u", 1, MAX_ADDPATH_COUNT);
+				    "between %u and %u", 1, USHRT_MAX);
 				YYERROR;
 			}
 			$$ = $2;
@@ -2014,7 +2011,7 @@ peeropts	: REMOTEAS as4number	{
 			if (!strcmp($4, "no")) {
 				free($4);
 				if ($5 != 0 || $6 != 0 || $7 != 0) {
-					yyerror("cannot use additional options "
+					yyerror("no additional option allowed "
 					    "for 'add-path send no'");
 					YYERROR;
 				}
@@ -2022,18 +2019,13 @@ peeropts	: REMOTEAS as4number	{
 			} else if (!strcmp($4, "all")) {
 				free($4);
 				if ($5 != 0 || $6 != 0) {
-					yyerror("cannot use additional options "
+					yyerror("no additional option allowed "
 					    "for 'add-path send all'");
 					YYERROR;
 				}
 				mode = ADDPATH_EVAL_ALL;
 			} else if (!strcmp($4, "best")) {
 				free($4);
-				if ($6 != 0) {
-					yyerror("cannot use max option "
-					    "for 'add-path send best'");
-					YYERROR;
-				}
 				mode = ADDPATH_EVAL_BEST;
 			} else if (!strcmp($4, "ecmp")) {
 				free($4);
@@ -3609,8 +3601,8 @@ lookup(char *s)
 		{ "export-target",	EXPORTTRGT },
 		{ "ext-community",	EXTCOMMUNITY },
 		{ "extended",		EXTENDED },
-		{ "fib-multipath",	FIBMULTIPATH },
 		{ "fib-priority",	FIBPRIORITY },
+		{ "fib-multipath",	FIBMULTIPATH },
 		{ "fib-update",		FIBUPDATE },
 		{ "filtered",		FILTERED },
 		{ "flags",		FLAGS },
@@ -5558,7 +5550,7 @@ merge_aspa_set(uint32_t as, struct aspa_tas_l *tas, time_t expires)
 		RB_INSERT(aspa_tree, &conf->aspa, aspa);
 	}
 
-	if (tas->num > MAX_ASPA_SPAS_COUNT - aspa->num) {
+	if (MAX_ASPA_SPAS_COUNT - aspa->num <= tas->num) {
 		yyerror("too many providers for customer-as %u", as);
 		return -1;
 	}
@@ -5646,7 +5638,7 @@ getservice(char *n)
 		s = getservbyname(n, "udp");
 	if (s == NULL)
 		return -1;
-	return ntohs(s->s_port);
+	return s->s_port;
 }
 
 static int
@@ -5709,7 +5701,6 @@ flow_to_flowspec(struct flowspec_context *ctx)
 		aid = AID_FLOWSPECv6;
 		break;
 	default:
-		yyerror("unknown AID %d", ctx->aid);
 		return NULL;
 	}
 
@@ -5717,16 +5708,9 @@ flow_to_flowspec(struct flowspec_context *ctx)
 		if (ctx->components[i] != NULL)
 			len += ctx->complen[i] + 1;
 
-	if (len > FLOWSPEC_SIZE_MAX) {
-		yyerror("flowspec too long %d > %d", len, FLOWSPEC_SIZE_MAX);
-		return NULL;
-	}
-
 	f = flowspec_alloc(aid, len);
-	if (f == NULL) {
-		yyerror("out of memory");
+	if (f == NULL)
 		return NULL;
-	}
 
 	len = 0;
 	for (i = FLOWSPEC_TYPE_MIN; i < FLOWSPEC_TYPE_MAX; i++)
@@ -6118,8 +6102,6 @@ merge_auth_conf(struct auth_config *to, struct auth_config *from)
 				to->spi_in = from->spi_in;
 				to->auth_alg_in = from->auth_alg_in;
 				to->enc_alg_in = from->enc_alg_in;
-				memcpy(to->auth_key_in, from->auth_key_in,
-				    sizeof(to->auth_key_in));
 				memcpy(to->enc_key_in, from->enc_key_in,
 				    sizeof(to->enc_key_in));
 				to->enc_keylen_in = from->enc_keylen_in;
@@ -6129,8 +6111,6 @@ merge_auth_conf(struct auth_config *to, struct auth_config *from)
 				to->spi_out = from->spi_out;
 				to->auth_alg_out = from->auth_alg_out;
 				to->enc_alg_out = from->enc_alg_out;
-				memcpy(to->auth_key_out, from->auth_key_out,
-				    sizeof(to->auth_key_out));
 				memcpy(to->enc_key_out, from->enc_key_out,
 				    sizeof(to->enc_key_out));
 				to->enc_keylen_out = from->enc_keylen_out;

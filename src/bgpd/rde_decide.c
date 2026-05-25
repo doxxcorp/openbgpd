@@ -1,4 +1,4 @@
-/*	$OpenBSD: rde_decide.c,v 1.108 2026/05/21 15:20:27 claudio Exp $ */
+/*	$OpenBSD: rde_decide.c,v 1.106 2025/12/01 13:07:28 claudio Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Claudio Jeker <claudio@openbsd.org>
@@ -524,11 +524,9 @@ prefix_best(struct rib_entry *re)
 /*
  * Find the correct place to insert the prefix in the prefix list.
  * If the active prefix has changed we need to send an update also special
- * treatment is needed if 'rde evaluate all' or add-path is used on some peers.
- * To re-evaluate a prefix it is best to first call prefix_evaluate with
- * new = NULL, old = prefix, adjust the prefix and then call prefix_evaluate
- * with new = prefix, old = NULL. This ensures proper evaluation in case
- * the prefix change influences prefix_eligible() or MED handling.
+ * treatment is needed if 'rde evaluate all' is used on some peers.
+ * To re-evaluate a prefix just call prefix_evaluate with old and new pointing
+ * to the same prefix.
  */
 void
 prefix_evaluate(struct rib_entry *re, struct prefix *new, struct prefix *old)
@@ -554,13 +552,8 @@ prefix_evaluate(struct rib_entry *re, struct prefix *new, struct prefix *old)
 		prefix_remove(old, re);
 		old_pathid_tx = old->path_id_tx;
 	}
-	if (new != NULL) {
+	if (new != NULL)
 		prefix_insert(new, NULL, re);
-		if (!prefix_eligible(new))
-			new = NULL;
-		else
-			old_pathid_tx = 0;
-	}
 	newbest = prefix_best(re);
 
 	/*
@@ -568,27 +561,51 @@ prefix_evaluate(struct rib_entry *re, struct prefix *new, struct prefix *old)
 	 * and added again then generate an update.
 	 */
 	if (oldbest != newbest || (old != NULL && newbest == old)) {
-		/*
-		 * Send update withdrawing oldbest and adding newbest
-		 * but remember that newbest may be NULL aka ineligible.
-		 * Additional decision may be made by the called functions.
-		 */
 		if ((rib->flags & F_RIB_NOFIB) == 0)
 			rde_send_kroute(rib, newbest, oldbest);
-		rde_enqueue_updates(re, new, old_pathid_tx, EVAL_DEFAULT);
+		rde_generate_updates(re, new, old_pathid_tx, EVAL_DEFAULT);
 		return;
+	}
+
+	/*
+	 * ECMP: best didn't change but the ECMP set may have changed.
+	 * Resend the kroute so the FIB multipath nexthop set is updated.
+	 * Also resend when an ECMP sibling was removed (old != NULL) so
+	 * the kernel route is updated from multipath to single-path.
+	 */
+	if (newbest != NULL && (rib->flags & F_RIB_NOFIB) == 0 &&
+	    (new != NULL || old != NULL)) {
+		struct prefix *ep;
+		int ecmp = (prefix_nhflags(newbest) & NEXTHOP_ECMP);
+		ep = TAILQ_NEXT(newbest, rib_l);
+		if (!ecmp && ep != NULL &&
+		    (prefix_nhflags(ep) & NEXTHOP_ECMP))
+			ecmp = 1;
+		if (ecmp && ep != NULL &&
+		    ep->dmetric == PREFIX_DMETRIC_ECMP)
+			rde_send_kroute(rib, newbest, NULL);
+		else if (old != NULL) {
+			/*
+			 * ECMP sibling withdrawn: send a DELETE for the
+			 * old nexthop so kr_delete -> kroute_remove can
+			 * purge it from the multipath chain, then resend
+			 * the remaining best as a CHANGE.
+			 */
+			rde_send_kroute(rib, NULL, old);
+			rde_send_kroute(rib, newbest, NULL);
+		}
 	}
 
 	/*
 	 * If there are peers with 'rde evaluate all' every update needs
 	 * to be passed on (not only a change of the best prefix).
-	 * rde_enqueue_updates() will then take care of distribution.
+	 * rde_generate_updates() will then take care of distribution.
 	 */
 	if (rde_evaluate_all()) {
-		/* no old path to remove and path is ineligible, skip rest */
-		if (old_pathid_tx == 0 && new == NULL)
-			return;
-		rde_enqueue_updates(re, new, old_pathid_tx, EVAL_ALL);
+		if (new != NULL && !prefix_eligible(new))
+			new = NULL;
+		if (new != NULL || old != NULL)
+			rde_generate_updates(re, new, old_pathid_tx, EVAL_ALL);
 	}
 }
 
@@ -599,7 +616,7 @@ prefix_evaluate_nexthop(struct prefix *p, enum nexthop_state state,
 	struct rib_entry *re = prefix_re(p);
 	struct prefix	*newbest, *oldbest, *new, *old;
 	struct rib	*rib;
-	uint32_t	 old_pathid_tx = 0;
+	uint32_t	 old_pathid_tx;
 
 	/* Skip non local-RIBs or RIBs that are flagged as noeval. */
 	rib = re_rib(re);
@@ -632,8 +649,7 @@ prefix_evaluate_nexthop(struct prefix *p, enum nexthop_state state,
 
 	old = p;
 	prefix_remove(old, re);
-	if (prefix_eligible(old))
-		old_pathid_tx = old->path_id_tx;
+	old_pathid_tx = old->path_id_tx;
 
 	if (state == NEXTHOP_REACH)
 		p->nhflags |= NEXTHOP_VALID;
@@ -643,15 +659,6 @@ prefix_evaluate_nexthop(struct prefix *p, enum nexthop_state state,
 	new = p;
 	prefix_insert(new, NULL, re);
 	newbest = prefix_best(re);
-
-	if (!prefix_eligible(new))
-		new = NULL;
-	else
-		old_pathid_tx = 0;
-
-	/* path was and still is ineligible, skip rest */
-	if (old_pathid_tx == 0 && new == NULL)
-		return;
 
 	/*
 	 * If the active prefix changed or the active prefix was removed
@@ -665,15 +672,18 @@ prefix_evaluate_nexthop(struct prefix *p, enum nexthop_state state,
 		 */
 		if ((rib->flags & F_RIB_NOFIB) == 0)
 			rde_send_kroute(rib, newbest, oldbest);
-		rde_enqueue_updates(re, new, old_pathid_tx, EVAL_DEFAULT);
+		rde_generate_updates(re, new, old_pathid_tx, EVAL_DEFAULT);
 		return;
 	}
 
 	/*
 	 * If there are peers with 'rde evaluate all' every update needs
 	 * to be passed on (not only a change of the best prefix).
-	 * rde_enqueue_updates() will then take care of distribution.
+	 * rde_generate_updates() will then take care of distribution.
 	 */
-	if (rde_evaluate_all())
-		rde_enqueue_updates(re, new, old_pathid_tx, EVAL_ALL);
+	if (rde_evaluate_all()) {
+		if (!prefix_eligible(new))
+			new = NULL;
+		rde_generate_updates(re, new, old_pathid_tx, EVAL_ALL);
+	}
 }

@@ -1,4 +1,4 @@
-/*	$OpenBSD: rde_peer.c,v 1.74 2026/05/21 15:20:27 claudio Exp $ */
+/*	$OpenBSD: rde_peer.c,v 1.72 2026/05/08 12:03:50 tb Exp $ */
 
 /*
  * Copyright (c) 2019 Claudio Jeker <claudio@openbsd.org>
@@ -250,8 +250,7 @@ RB_GENERATE(peer_tree, rde_peer, entry, peer_cmp);
 
 static void
 peer_generate_update(struct rde_peer *peer, struct rib_entry *re,
-    struct prefix *newpath, uint32_t old_pathid_tx, enum eval_mode mode,
-    int force_update)
+    struct prefix *newpath, uint32_t old_pathid_tx, enum eval_mode mode)
 {
 	uint8_t		 aid;
 
@@ -285,22 +284,22 @@ peer_generate_update(struct rde_peer *peer, struct rib_entry *re,
 		 */
 		if (peer->eval.mode == ADDPATH_EVAL_ALL) {
 			up_generate_addpath_all(peer, re, newpath,
-			    old_pathid_tx, force_update);
+			    old_pathid_tx);
 			return;
 		}
 #endif
-		up_generate_addpath(peer, re, force_update);
+		up_generate_addpath(peer, re);
 		return;
 	}
 
 	/* skip regular peers if the best path didn't change */
 	if (mode == EVAL_ALL && (peer->flags & PEERFLAG_EVALUATE_ALL) == 0)
 		return;
-	up_generate_updates(peer, re, force_update);
+	up_generate_updates(peer, re);
 }
 
 void
-rde_enqueue_updates(struct rib_entry *re, struct prefix *newpath,
+rde_generate_updates(struct rib_entry *re, struct prefix *newpath,
     uint32_t old_pathid_tx, enum eval_mode mode)
 {
 	struct rde_peer	*peer;
@@ -311,7 +310,7 @@ rde_enqueue_updates(struct rib_entry *re, struct prefix *newpath,
 		RB_FOREACH(peer, peer_tree, &peertable) {
 			if (peer->reconf_out == 0)
 				continue;
-			peer_generate_update(peer, re, NULL, 0, EVAL_RECONF, 0);
+			peer_generate_update(peer, re, NULL, 0, EVAL_RECONF);
 		}
 		return;
 	case EVAL_DEFAULT:
@@ -368,7 +367,7 @@ peer_process_updates(struct rde_peer *peer, void *bula)
 	mode = re->pq_mode;
 
 	RB_FOREACH(p, peer_tree, &peertable)
-		peer_generate_update(p, re, NULL, 0, mode, 0);
+		peer_generate_update(p, re, NULL, 0, mode);
 
 	rib_dequeue(re);
 }
@@ -665,7 +664,7 @@ peer_dump_upcall(struct rib_entry *re, void *ptr)
 		/* no eligible prefix, not even for 'evaluate all' */
 		return;
 
-	peer_generate_update(peer, re, NULL, 0, EVAL_DEFAULT, 1);
+	peer_generate_update(peer, re, NULL, 0, EVAL_DEFAULT);
 }
 
 static void
@@ -689,7 +688,7 @@ peer_dump(struct rde_peer *peer, uint8_t aid)
 		peer_blast(peer, aid);
 	} else if (peer->export_type == EXPORT_DEFAULT_ROUTE) {
 		up_generate_default(peer, aid);
-		peer_blast_done(peer, aid);
+		peer_blast(peer, aid);
 	} else if (aid == AID_FLOWSPECv4 || aid == AID_FLOWSPECv6) {
 		prefix_flowspec_dump(aid, peer, peer_dump_upcall,
 		    peer_dump_done);

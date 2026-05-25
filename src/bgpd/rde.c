@@ -1,4 +1,4 @@
-/*	$OpenBSD: rde.c,v 1.703 2026/05/21 15:20:27 claudio Exp $ */
+/*	$OpenBSD: rde.c,v 1.698 2026/05/08 12:03:50 tb Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -92,7 +92,7 @@ void		 rde_mark_prefixsets_dirty(struct rde_prefixset_head *,
 uint8_t		 rde_roa_validity(struct rde_prefixset *,
 		    struct bgpd_addr *, uint8_t, uint32_t);
 
-static void	 rde_peer_recv_eor(struct rde_peer *, u_int);
+static void	 rde_peer_recv_eor(struct rde_peer *, uint8_t);
 static void	 rde_peer_send_eor(struct rde_peer *, uint8_t);
 
 void		 network_add(struct network_config *, struct filterstate *);
@@ -3276,7 +3276,7 @@ rde_dump_ctx_new(struct ctl_show_rib_request *req, pid_t pid,
 	struct rib_entry	*re;
 	struct adjout_prefix	*p;
 	u_int			 error;
-	int			 hostplen, plen;
+	uint8_t			 hostplen, plen;
 	uint16_t		 rid;
 
 	if ((ctx = calloc(1, sizeof(*ctx))) == NULL) {
@@ -3342,7 +3342,6 @@ rde_dump_ctx_new(struct ctl_show_rib_request *req, pid_t pid,
 
 			do {
 				struct pt_entry *pte;
-				int found;
 
 				if (req->flags & F_SHORTER) {
 					for (plen = 0; plen <= req->prefixlen;
@@ -3371,30 +3370,13 @@ rde_dump_ctx_new(struct ctl_show_rib_request *req, pid_t pid,
 				if (pte == NULL)
 					continue;
 
-				do {
-					/* dump all matching paths */
-					found = 0;
-					for (p = adjout_prefix_first(peer, pte);
-					    p != NULL;
-					    p = adjout_prefix_next(peer, pte,
-					    p)) {
-						rde_dump_adjout_upcall(peer,
-						    pte, p, ctx);
-						found = 1;
-					}
-					plen = pte->prefixlen - 1;
-					pte = NULL;
-					if (!found &&
-					    req->prefixlen == hostplen) {
-						while (plen >= 0) {
-							pte = pt_get(
-							    &req->prefix, plen);
-							if (pte != NULL)
-								break;
-							plen--;
-						}
-					}
-				} while (!found && pte != NULL);
+				/* dump all matching paths */
+				for (p = adjout_prefix_first(peer, pte);
+				    p != NULL;
+				    p = adjout_prefix_next(peer, pte, p)) {
+					rde_dump_adjout_upcall(peer, pte, p,
+					    ctx);
+				}
 			} while ((peer = peer_match(&req->neighbor,
 			    peer->conf.id)));
 
@@ -3403,12 +3385,7 @@ rde_dump_ctx_new(struct ctl_show_rib_request *req, pid_t pid,
 			free(ctx);
 			return;
 		default:
-			log_warnx("%s: bad imsg type %d", __func__, req->type);
-			error = CTL_RES_OPNOTSUPP;
-			imsg_compose(ibuf_se_ctl, IMSG_CTL_RESULT, 0, pid, -1,
-			    &error, sizeof(error));
-			free(ctx);
-			return;
+			fatalx("%s: unsupported imsg type", __func__);
 		}
 
 		LIST_INSERT_HEAD(&rde_dump_h, ctx, entry);
@@ -3570,7 +3547,7 @@ void
 rde_send_kroute(struct rib *rib, struct prefix *new, struct prefix *old)
 {
 	struct kroute_full	 kf;
-	struct prefix		*p;
+	struct prefix		*p, *xp;
 	struct l3vpn		*vpn;
 	enum imsg_type		 type;
 
@@ -3598,6 +3575,16 @@ rde_send_kroute(struct rib *rib, struct prefix *new, struct prefix *old)
 			kf.flags |= F_REJECT;
 		if (prefix_nhflags(p) == NEXTHOP_BLACKHOLE)
 			kf.flags |= F_BLACKHOLE;
+		if (prefix_nhflags(p) & NEXTHOP_ECMP)
+			kf.flags |= F_ECMP;
+		if (!(kf.flags & F_ECMP)) {
+			struct prefix *ep;
+			ep = TAILQ_NEXT(p, rib_l);
+			if (ep != NULL &&
+			    ep->dmetric == PREFIX_DMETRIC_ECMP &&
+			    (prefix_nhflags(ep) & NEXTHOP_ECMP))
+				kf.flags |= F_ECMP;
+		}
 		kf.nexthop = prefix_nexthop(p)->exit_nexthop;
 		strlcpy(kf.label, rtlabel_id2name(prefix_aspath(p)->rtlabelid),
 		    sizeof(kf.label));
@@ -3635,6 +3622,46 @@ rde_send_kroute(struct rib *rib, struct prefix *new, struct prefix *old)
 		    &kf, sizeof(kf)) == -1)
 			fatal("%s %d imsg_compose error", __func__, __LINE__);
 		break;
+	}
+
+	/*
+	 * ECMP: send kroute changes for all ECMP siblings so the FIB
+	 * installer can build the multipath nexthop list.
+	 */
+	if (type == IMSG_KROUTE_CHANGE && (kf.flags & F_ECMP)) {
+		for (xp = TAILQ_NEXT(p, rib_l); xp != NULL;
+		    xp = TAILQ_NEXT(xp, rib_l)) {
+			if (xp->dmetric != PREFIX_DMETRIC_ECMP)
+				break;
+			if (prefix_aspath(xp)->flags & F_PREFIX_ANNOUNCED)
+				continue;
+			if (prefix_nexthop(xp) == NULL)
+				continue;
+
+			memset(&kf, 0, sizeof(kf));
+			pt_getaddr(xp->pt, &kf.prefix);
+			kf.prefixlen = xp->pt->prefixlen;
+			kf.flags |= F_ECMP;
+			kf.nexthop = prefix_nexthop(xp)->exit_nexthop;
+			strlcpy(kf.label,
+			    rtlabel_id2name(prefix_aspath(xp)->rtlabelid),
+			    sizeof(kf.label));
+
+			switch (kf.prefix.aid) {
+			case AID_INET:
+				if (kf.nexthop.aid != AID_INET)
+					continue;
+				break;
+			case AID_INET6:
+				break;
+			default:
+				continue;
+			}
+			if (imsg_compose(ibuf_main, IMSG_KROUTE_CHANGE,
+			    rib->rtableid, 0, -1, &kf, sizeof(kf)) == -1)
+				fatal("%s %d imsg_compose error", __func__,
+				    __LINE__);
+		}
 	}
 }
 
@@ -4097,8 +4124,11 @@ rde_reload_done(void)
 			reload++;
 			break;
 		case RECONF_REINIT:
-			/* new rib */
+			/* new rib - needs FIB sync after softreconfig */
 			rib->state = RECONF_RELOAD;
+			if ((rib->flags & (F_RIB_NOFIB | F_RIB_NOEVALUATE))
+			    == 0)
+				rib->fibstate = RECONF_RELOAD;
 			reload++;
 			break;
 		case RECONF_NONE:
@@ -4284,7 +4314,7 @@ rde_softreconfig_out(struct rib_entry *re, void *arg)
 		/* no valid path for prefix */
 		return;
 
-	rde_enqueue_updates(re, NULL, 0, EVAL_RECONF);
+	rde_generate_updates(re, NULL, 0, EVAL_RECONF);
 }
 
 static void
@@ -4559,7 +4589,7 @@ rde_decisionflags(void)
 
 /* End-of-RIB marker, RFC 4724 */
 static void
-rde_peer_recv_eor(struct rde_peer *peer, u_int aid)
+rde_peer_recv_eor(struct rde_peer *peer, uint8_t aid)
 {
 	peer->stats.prefix_rcvd_eor++;
 	peer->recv_eor |= 1 << aid;

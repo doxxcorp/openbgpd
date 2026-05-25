@@ -93,6 +93,8 @@ imsg_send_filterset(struct imsgbuf *imsgbuf, struct filter_set_head *set)
 			if (ibuf_add_n8(msg, s->action.origin) == -1)
 				goto fail;
 			break;
+		case ACTION_SET_ECMP:
+			break;
 		}
 	}
 
@@ -171,6 +173,8 @@ ibuf_recv_one_filterset(struct ibuf *ibuf, struct filter_set *set)
 	case ACTION_SET_ORIGIN:
 		if (ibuf_get_n8(ibuf, &set->action.origin) == -1)
 			return -1;
+		break;
+	case ACTION_SET_ECMP:
 		break;
 	}
 	return 0;

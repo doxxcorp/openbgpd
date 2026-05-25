@@ -365,6 +365,9 @@ print_set(struct filter_set_head *set)
 			printf("origin ");
 			print_origin(s->action.origin);
 			break;
+		case ACTION_SET_ECMP:
+			printf("fib-multipath ");
+			break;
 		}
 	}
 	printf("}");

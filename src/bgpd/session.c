@@ -1,4 +1,4 @@
-/*	$OpenBSD: session.c,v 1.537 2026/05/14 12:26:44 claudio Exp $ */
+/*	$OpenBSD: session.c,v 1.534 2026/05/08 12:03:50 tb Exp $ */
 
 /*
  * Copyright (c) 2003, 2004, 2005 Henning Brauer <henning@openbsd.org>
@@ -796,11 +796,8 @@ session_connect(struct peer *peer)
 	}
 
 	if (tcp_md5_set(peer->fd, &peer->auth_conf,
-	    &peer->conf.remote_addr) == -1) {
+	    &peer->conf.remote_addr) == -1)
 		log_peer_warn(&peer->conf, "setting md5sig");
-		bgp_fsm(peer, EVNT_CON_OPENFAIL, NULL);
-		return (-1);
-	}
 
 	/* if local-address is set we need to bind() */
 	bind_addr = session_localaddr(peer);
@@ -1115,7 +1112,7 @@ session_graceful_stop(struct peer *p)
 }
 
 void
-session_graceful_flush(struct peer *p, u_int aid, const char *why)
+session_graceful_flush(struct peer *p, uint8_t aid, const char *why)
 {
 	log_peer_warnx(&p->conf, "graceful restart of %s, %s, flushing",
 	    aid2str(aid), why);
@@ -1211,9 +1208,8 @@ session_dispatch_imsg(struct imsgbuf *imsgbuf, int idx, u_int *listener_cnt)
 	struct session_dependon	 sdon;
 	uint32_t		 peerid;
 	int			 n, fd, depend_ok, restricted;
-	u_int			 aid;
 	uint16_t		 t;
-	uint8_t			 errcode, subcode;
+	uint8_t			 aid, errcode, subcode;
 
 	while (imsgbuf) {
 		if ((n = imsg_get(imsgbuf, &imsg)) == -1)
@@ -1981,8 +1977,6 @@ merge_peers(struct bgpd_config *c, struct bgpd_config *nc)
 					continue;
 				session_template_clone(xp, NULL, xp->conf.id,
 				    xp->conf.remote_as);
-
-				xp->local_bgpid = nc->bgpid;
 
 				if (xp->rdesession)
 					imsg_rde(IMSG_SESSION_ADD,

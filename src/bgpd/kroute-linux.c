@@ -4,7 +4,6 @@
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
  * Copyright (c) 2022 Claudio Jeker <claudio@openbsd.org>
  * Copyright (c) 2021 Ariadne Conill <ariadne@dereferenced.org>
- * Copyright (c) 2026 Barrett Lyon <blyon@doxx.net>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -178,7 +177,6 @@ void		 kroute_detach_nexthop(struct ktable *, struct knexthop *);
 uint8_t		prefixlen_classful(in_addr_t);
 static uint8_t	mask2prefixlen4(struct sockaddr_in *);
 static uint8_t	mask2prefixlen6(struct sockaddr_in6 *);
-static u_short	resolve_v6_ifindex(struct in6_addr *);
 #ifdef NOTYET
 uint64_t	ift2ifm(uint8_t);
 const char	*get_media_descr(uint64_t);
@@ -514,22 +512,24 @@ kr4_change(struct ktable *kt, struct kroute_full *kf)
 			krn->flags |= F_BGPD_INSERTED;
 	} else if ((kf->flags & F_ECMP) && kr->next != NULL) {
 		/*
-		 * ECMP resend: this nexthop is already in the chain
-		 * and siblings exist.  Reinstall the full multipath
-		 * set via add_multipath_attr.
+		 * ECMP: matchgw found this nexthop already in the chain.
+		 * Resend the full multipath route to the kernel.
+		 *
+		 * After resending, mark this chain entry as "seen" by
+		 * storing the current update generation. A subsequent
+		 * sweep (triggered by KROUTE_DELETE or timer) can purge
+		 * entries not seen in the latest generation.
 		 */
 		if (send_rtmsg(RTM_CHANGE, kt, kf))
 			kr->flags |= F_BGPD_INSERTED;
 	} else {
 		/*
-		 * Non-ECMP update or last remaining ECMP nexthop.
-		 * When kr->next is set the ECMP set has shrunk and
-		 * stale chain entries need to go.  Linux will not
-		 * replace a multipath route with a single-nexthop
-		 * route via NLM_F_REPLACE, so we delete the whole
-		 * route, purge the chain, then reinstall with
-		 * RTM_ADD.
-		 * blyon@doxx.net
+		 * Existing prefix, nexthop already in chain (or single).
+		 * If kr->next != NULL, stale chain entries may remain
+		 * from a prior ECMP set that has shrunk. Delete the old
+		 * multipath route, purge the chain, and reinstall with
+		 * just this nexthop. The kernel won't replace multipath
+		 * with single-nexthop via NLM_F_REPLACE alone.
 		 */
 		int was_multipath = (kr->next != NULL);
 		if (was_multipath) {
@@ -2899,8 +2899,6 @@ add_multipath_attr(struct nlmsghdr *nlh, struct ktable *kt,
 				if (nhkr != NULL)
 					ifidx = nhkr->ifindex;
 			}
-			if (ifidx == 0)
-				ifidx = resolve_v6_ifindex(&km6->nexthop);
 
 			rtnh = (struct rtnexthop *)(mpbuf + off);
 			rtnh->rtnh_len = nhlen;
@@ -2929,64 +2927,6 @@ add_multipath_attr(struct nlmsghdr *nlh, struct ktable *kt,
 		nhops = 0;
 
 	return (nhops);
-}
-
-/*
- * Resolve the output interface index for an IPv6 nexthop by asking
- * the kernel via RTM_GETROUTE.  Returns the ifindex or 0 on failure.
- *
- * The covering route for an iBGP nexthop may not exist in the local
- * kroute tree when it is managed by another routing process.
- * Without a valid ifindex the kernel rejects RTNH_F_ONLINK and the
- * route silently disappears during a multipath-to-single transition.
- * Querying the kernel directly is the only reliable fallback.
- * blyon@doxx.net
- */
-static u_short
-resolve_v6_ifindex(struct in6_addr *nexthop)
-{
-	char buf[MNL_SOCKET_BUFFER_SIZE];
-	struct nlmsghdr *nlh;
-	struct rtmsg *rtm;
-	struct mnl_socket *nl;
-	ssize_t len;
-	u_short ifidx = 0;
-
-	nlh = mnl_nlmsg_put_header(buf);
-	nlh->nlmsg_type = RTM_GETROUTE;
-	nlh->nlmsg_flags = NLM_F_REQUEST;
-	nlh->nlmsg_seq = 0;
-
-	rtm = mnl_nlmsg_put_extra_header(nlh, sizeof(struct rtmsg));
-	rtm->rtm_family = AF_INET6;
-	rtm->rtm_dst_len = 128;
-
-	mnl_attr_put(nlh, RTA_DST, sizeof(struct in6_addr), nexthop);
-
-	nl = mnl_socket_open(NETLINK_ROUTE);
-	if (nl == NULL)
-		return (0);
-	if (mnl_socket_bind(nl, 0, MNL_SOCKET_AUTOPID) < 0) {
-		mnl_socket_close(nl);
-		return (0);
-	}
-	if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0) {
-		mnl_socket_close(nl);
-		return (0);
-	}
-	len = mnl_socket_recvfrom(nl, buf, sizeof(buf));
-	if (len > 0) {
-		struct nlattr *attr;
-		nlh = (struct nlmsghdr *)buf;
-		mnl_attr_for_each(attr, nlh, sizeof(struct rtmsg)) {
-			if (mnl_attr_get_type(attr) == RTA_OIF) {
-				ifidx = mnl_attr_get_u32(attr);
-				break;
-			}
-		}
-	}
-	mnl_socket_close(nl);
-	return (ifidx);
 }
 
 int
@@ -3077,8 +3017,6 @@ send_rtmsg(int action, struct ktable *kt, struct kroute_full *kf)
 			if (nhkr != NULL)
 				ifidx = nhkr->ifindex;
 		}
-		if (ifidx == 0)
-			ifidx = resolve_v6_ifindex(&kf->nexthop.v6);
 
 		if (ifidx != 0) {
 			memset(mpbuf, 0, nhlen);
