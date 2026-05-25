@@ -1,0 +1,19 @@
+From dfd671d000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Barrett Lyon <blyon@doxx.net>
+Date: Thu, 22 May 2026 07:30:00 -0700
+Subject: [PATCH 7/7] Add F_ECMP flag for Linux ECMP multipath support
+
+---
+ src/usr.sbin/bgpd/bgpd.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+--- src/usr.sbin/bgpd/bgpd.h
++++ src/usr.sbin/bgpd/bgpd.h
+@@ -96,6 +96,7 @@
+ #define	F_REJECT		0x0020
+ #define	F_BLACKHOLE		0x0040
+ #define	F_MPLS			0x0080
++#define	F_ECMP			0x0100
+ #define	F_LONGER		0x0200
+ #define	F_SHORTER		0x0400
+ #define	F_CTL_DETAIL		0x1000		/* only set on requests */

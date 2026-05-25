@@ -1,40 +1,33 @@
 name: CodeQL analysis
 
 on:
-  push:
-  pull_request:
   schedule:
-    # build the main branch every Monday morning
     - cron: '22 5 * * 1'
   workflow_dispatch:
 
 jobs:
   analyze:
-    name: Analyze
+    name: Analyze (cpp)
     runs-on: ubuntu-latest
     permissions:
       actions: read
       contents: read
       security-events: write
-    strategy:
-      fail-fast: false
-      matrix:
-        language: [ 'cpp' ]
     steps:
     - name: Checkout repository
       uses: actions/checkout@v6
     - name: Initialize CodeQL
       uses: github/codeql-action/init@v4
       with:
-        languages: ${{ matrix.language }}
-    - name: Build Application using script
+        languages: cpp
+    - name: Build
       run: |
         sudo apt-get update
-        sudo apt-get install libevent-dev
+        sudo apt-get install -y libevent-dev libmnl-dev libbsd-dev autoconf automake libtool byacc
         ./autogen.sh
-        ./configure
-        make
+        ./configure --prefix=/ --sysconfdir=/etc --localstatedir=/var --with-privsep-user=_bgpd
+        make -j$(nproc)
     - name: Perform CodeQL Analysis
       uses: github/codeql-action/analyze@v4
       with:
-        category: "/language:${{matrix.language}}"
+        category: "/language:cpp"

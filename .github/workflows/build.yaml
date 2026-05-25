@@ -19,7 +19,7 @@ jobs:
       - name: install missing deps
         run: |
           sudo apt-get update
-          sudo apt-get install libevent-dev
+          sudo apt-get install -y libevent-dev libmnl-dev libbsd-dev autoconf automake libtool byacc
       - name: autogen
         run: ./autogen.sh
       - name: compiler
