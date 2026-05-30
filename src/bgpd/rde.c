@@ -4377,11 +4377,9 @@ rde_softreconfig_done(void)
 	imsg_compose(ibuf_main, IMSG_RECONF_DONE, 0, 0,
 	    -1, NULL, 0);
 
-	if (!monotime_valid(ecmp_fib_sync_deadline)) {
-		ecmp_fib_sync_deadline = monotime_add(getmonotime(),
-		    monotime_from_sec(20));
-		log_info("ECMP fib resync scheduled in 20s");
-	}
+	ecmp_fib_sync_deadline = monotime_add(getmonotime(),
+	    monotime_from_sec(20));
+	log_info("ECMP fib resync scheduled in 20s");
 }
 
 static void
