@@ -604,6 +604,7 @@ struct flowspec {
 	uint8_t			data[1];
 };
 #define FLOWSPEC_SIZE	(offsetof(struct flowspec, data))
+#define FLOWSPEC_SIZE_MAX	4096
 
 struct flowspec_config {
 	RB_ENTRY(flowspec_config)	 entry;
