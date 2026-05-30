@@ -177,6 +177,7 @@ void		 kroute_detach_nexthop(struct ktable *, struct knexthop *);
 uint8_t		prefixlen_classful(in_addr_t);
 static uint8_t	mask2prefixlen4(struct sockaddr_in *);
 static uint8_t	mask2prefixlen6(struct sockaddr_in6 *);
+static u_short	resolve_v6_ifindex(struct in6_addr *);
 #ifdef NOTYET
 uint64_t	ift2ifm(uint8_t);
 const char	*get_media_descr(uint64_t);
@@ -2008,49 +2009,14 @@ kroute_remove(struct ktable *kt, struct kroute_full *kf, int any)
 	if (kf->flags & F_BGPD_INSERTED) {
 		if (multipath) {
 			/*
-			 * Multipath: sibling nexthops remain. Delete the
-			 * entire old route (clear nexthop so kernel removes
-			 * all nexthops, not just one) and reinstall with
-			 * the reduced set.
+			 * Multipath: sibling nexthops remain. Remove just the
+			 * withdrawn nexthop from the kernel multipath route by
+			 * sending RTM_DELROUTE with the specific nexthop in
+			 * RTA_MULTIPATH. The kernel shrinks the multipath set,
+			 * leaving the remaining nexthop(s) intact. This is
+			 * atomic -- no window where the route is absent.
 			 */
-			memset(&ekf, 0, sizeof(ekf));
-			ekf.prefix = kf->prefix;
-			ekf.prefixlen = kf->prefixlen;
-			ekf.priority = kf->priority;
-			ekf.flags = kf->flags;
-			send_rtmsg(RTM_DELETE, kt, &ekf);
-			memset(&ekf, 0, sizeof(ekf));
-			ekf.prefix = kf->prefix;
-			ekf.prefixlen = kf->prefixlen;
-			ekf.priority = kf->priority;
-			ekf.flags = kf->flags;
-			switch (kf->prefix.aid) {
-			case AID_INET: {
-				struct kroute *kr;
-				kr = kroute_find(kt, &kf->prefix,
-				    kf->prefixlen, kf->priority);
-				if (kr != NULL) {
-					ekf.nexthop.aid = AID_INET;
-					ekf.nexthop.v4 = kr->nexthop;
-					ekf.ifindex = kr->ifindex;
-				}
-				break;
-			}
-			case AID_INET6: {
-				struct kroute6 *kr6;
-				kr6 = kroute6_find(kt, &kf->prefix,
-				    kf->prefixlen, kf->priority);
-				if (kr6 != NULL) {
-					ekf.nexthop.aid = AID_INET6;
-					ekf.nexthop.v6 = kr6->nexthop;
-					ekf.nexthop.scope_id =
-					    kr6->nexthop_scope_id;
-					ekf.ifindex = kr6->ifindex;
-				}
-				break;
-			}
-			}
-			send_rtmsg(RTM_ADD, kt, &ekf);
+			send_rtmsg(RTM_DELETE, kt, kf);
 		} else {
 			send_rtmsg(RTM_DELETE, kt, kf);
 		}
@@ -2899,6 +2865,8 @@ add_multipath_attr(struct nlmsghdr *nlh, struct ktable *kt,
 				if (nhkr != NULL)
 					ifidx = nhkr->ifindex;
 			}
+			if (ifidx == 0)
+				ifidx = resolve_v6_ifindex(&km6->nexthop);
 
 			rtnh = (struct rtnexthop *)(mpbuf + off);
 			rtnh->rtnh_len = nhlen;
@@ -2927,6 +2895,60 @@ add_multipath_attr(struct nlmsghdr *nlh, struct ktable *kt,
 		nhops = 0;
 
 	return (nhops);
+}
+
+/*
+ * Resolve the output interface index for an IPv6 nexthop by asking
+ * the kernel via RTM_GETROUTE.  Returns the ifindex or 0 on failure.
+ * This is needed when the covering route for the nexthop is managed
+ * by a different routing daemon (e.g. mesh bgpd) and thus absent
+ * from inet-bgpd's internal kroute tree.
+ */
+static u_short
+resolve_v6_ifindex(struct in6_addr *nexthop)
+{
+	char buf[MNL_SOCKET_BUFFER_SIZE];
+	struct nlmsghdr *nlh;
+	struct rtmsg *rtm;
+	struct mnl_socket *nl;
+	ssize_t len;
+	u_short ifidx = 0;
+
+	nlh = mnl_nlmsg_put_header(buf);
+	nlh->nlmsg_type = RTM_GETROUTE;
+	nlh->nlmsg_flags = NLM_F_REQUEST;
+	nlh->nlmsg_seq = 0;
+
+	rtm = mnl_nlmsg_put_extra_header(nlh, sizeof(struct rtmsg));
+	rtm->rtm_family = AF_INET6;
+	rtm->rtm_dst_len = 128;
+
+	mnl_attr_put(nlh, RTA_DST, sizeof(struct in6_addr), nexthop);
+
+	nl = mnl_socket_open(NETLINK_ROUTE);
+	if (nl == NULL)
+		return (0);
+	if (mnl_socket_bind(nl, 0, MNL_SOCKET_AUTOPID) < 0) {
+		mnl_socket_close(nl);
+		return (0);
+	}
+	if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0) {
+		mnl_socket_close(nl);
+		return (0);
+	}
+	len = mnl_socket_recvfrom(nl, buf, sizeof(buf));
+	if (len > 0) {
+		struct nlattr *attr;
+		nlh = (struct nlmsghdr *)buf;
+		mnl_attr_for_each(attr, nlh, sizeof(struct rtmsg)) {
+			if (mnl_attr_get_type(attr) == RTA_OIF) {
+				ifidx = mnl_attr_get_u32(attr);
+				break;
+			}
+		}
+	}
+	mnl_socket_close(nl);
+	return (ifidx);
 }
 
 int
@@ -2982,6 +3004,43 @@ send_rtmsg(int action, struct ktable *kt, struct kroute_full *kf)
 		return (-1);
 	}
 
+	/*
+	 * For DELETE of a specific nexthop from a multipath route,
+	 * include the nexthop in RTA_MULTIPATH so the kernel removes
+	 * just that one nexthop instead of the entire route.
+	 * IPv4 uses plain RTA_GATEWAY (kernel matches by gateway alone).
+	 * IPv6 needs RTA_MULTIPATH with RTNH_F_ONLINK and ifindex.
+	 */
+	if (action == RTM_DELETE &&
+	    (kf->flags & F_ECMP) &&
+	    kf->nexthop.aid != AID_UNSPEC &&
+	    kf->prefix.aid == AID_INET6) {
+		char mpbuf[256];
+		struct rtnexthop *rtnh;
+		struct rtattr *rta;
+		size_t gwlen = sizeof(struct in6_addr);
+		size_t nhlen = RTNH_ALIGN(sizeof(struct rtnexthop)) +
+		    RTA_SPACE(gwlen);
+		u_short ifidx = kf->ifindex;
+
+		if (ifidx == 0)
+			ifidx = resolve_v6_ifindex(&kf->nexthop.v6);
+		if (ifidx != 0) {
+			memset(mpbuf, 0, nhlen);
+			rtnh = (struct rtnexthop *)mpbuf;
+			rtnh->rtnh_len = nhlen;
+			rtnh->rtnh_flags = RTNH_F_ONLINK;
+			rtnh->rtnh_hops = 0;
+			rtnh->rtnh_ifindex = ifidx;
+			rta = (struct rtattr *)(mpbuf +
+			    RTNH_ALIGN(sizeof(struct rtnexthop)));
+			rta->rta_type = RTA_GATEWAY;
+			rta->rta_len = RTA_LENGTH(gwlen);
+			memcpy(RTA_DATA(rta), &kf->nexthop.v6, gwlen);
+			mnl_attr_put(nlh, RTA_MULTIPATH, nhlen, mpbuf);
+			goto skip_gw;
+		}
+	}
 	if (action != RTM_DELETE &&
 	    (kf->flags & F_ECMP) &&
 	    !(kf->flags & (F_BLACKHOLE|F_REJECT))) {
@@ -3017,6 +3076,8 @@ send_rtmsg(int action, struct ktable *kt, struct kroute_full *kf)
 			if (nhkr != NULL)
 				ifidx = nhkr->ifindex;
 		}
+		if (ifidx == 0)
+			ifidx = resolve_v6_ifindex(&kf->nexthop.v6);
 
 		if (ifidx != 0) {
 			memset(mpbuf, 0, nhlen);
