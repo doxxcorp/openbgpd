@@ -111,6 +111,8 @@ void		 rde_shutdown(void);
 static int	 ovs_match(uint8_t, uint32_t);
 static int	 avs_match(uint8_t, uint32_t);
 
+static monotime_t	ecmp_fib_sync_deadline;
+
 static struct imsgbuf		*ibuf_se;
 static struct imsgbuf		*ibuf_se_ctl;
 static struct imsgbuf		*ibuf_rtr;
@@ -359,6 +361,24 @@ rde_main(int debug, int verbose)
 
 		/* commit pftable once per poll loop */
 		rde_commit_pftable();
+
+		/* one-shot delayed ECMP fib sync after initial convergence */
+		if (monotime_valid(ecmp_fib_sync_deadline) &&
+		    monotime_cmp(getmonotime(), ecmp_fib_sync_deadline) >= 0) {
+			ecmp_fib_sync_deadline = monotime_clear();
+			log_info("running delayed ECMP fib resync");
+			for (i = 0; i < rib_size; i++) {
+				struct rib *rib = rib_byid(i);
+				if (rib == NULL)
+					continue;
+				if ((rib->flags &
+				    (F_RIB_NOFIB | F_RIB_NOEVALUATE)) == 0)
+					rib_dump_new(i, AID_UNSPEC,
+					    RDE_RUNNER_ROUNDS, rib,
+					    rde_softreconfig_sync_fib,
+					    rde_softreconfig_sync_done, NULL);
+			}
+		}
 	}
 
 	/* do not clean up on shutdown on production, it takes ages. */
@@ -4353,6 +4373,12 @@ rde_softreconfig_done(void)
 	log_info("RDE soft reconfiguration done");
 	imsg_compose(ibuf_main, IMSG_RECONF_DONE, 0, 0,
 	    -1, NULL, 0);
+
+	if (!monotime_valid(ecmp_fib_sync_deadline)) {
+		ecmp_fib_sync_deadline = monotime_add(getmonotime(),
+		    monotime_from_sec(20));
+		log_info("ECMP fib resync scheduled in 20s");
+	}
 }
 
 static void
