@@ -4397,10 +4397,20 @@ rde_softreconfig_sync_reeval(struct rib_entry *re, void *arg)
 static void
 rde_softreconfig_sync_fib(struct rib_entry *re, void *bula)
 {
-	struct prefix *p;
+	struct prefix *p, *ep;
 
-	if ((p = prefix_best(re)) != NULL)
-		rde_send_kroute(re_rib(re), p, NULL);
+	if ((p = prefix_best(re)) == NULL)
+		return;
+
+	/*
+	 * For ECMP prefixes, send the sibling first so the kroute process
+	 * can chain it before the best triggers the multipath install.
+	 */
+	ep = TAILQ_NEXT(p, rib_l);
+	if (ep != NULL && ep->dmetric == PREFIX_DMETRIC_ECMP &&
+	    (prefix_nhflags(p) & NEXTHOP_ECMP))
+		rde_send_kroute(re_rib(re), ep, NULL);
+	rde_send_kroute(re_rib(re), p, NULL);
 }
 
 static void
