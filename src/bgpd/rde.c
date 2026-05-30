@@ -529,6 +529,9 @@ rde_dispatch_imsg_session(struct imsgbuf *imsgbuf)
 			/* make sure rde_eval_all is on if needed. */
 			if (peer_has_add_path(peer, AID_UNSPEC, CAPA_AP_SEND))
 				rde_eval_all = 1;
+			/* Schedule ECMP fib resync after peer reconverges */
+			ecmp_fib_sync_deadline = monotime_add(getmonotime(),
+			    monotime_from_sec(20));
 			break;
 		case IMSG_SESSION_DOWN:
 			if ((peer = peer_get(peerid)) == NULL) {
