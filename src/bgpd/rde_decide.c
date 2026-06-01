@@ -583,19 +583,31 @@ prefix_evaluate(struct rib_entry *re, struct prefix *new, struct prefix *old)
 			ecmp = 1;
 		if (ecmp && ep != NULL &&
 		    ep->dmetric == PREFIX_DMETRIC_ECMP) {
-			if (new != NULL && new != newbest)
-				rde_send_kroute(rib, new, NULL);
-			rde_send_kroute(rib, newbest, NULL);
+			/*
+			 * ECMP set exists and is stable. Only touch FIB
+			 * when a member is withdrawn (old != NULL and was
+			 * an ECMP sibling). New paths joining the set are
+			 * handled by the delayed resync timer which
+			 * atomically rebuilds the full multipath FIB.
+			 * This prevents flip-flop from non-ECMP path
+			 * updates (iBGP from other PMs) clobbering the
+			 * multipath route.
+			 */
+			; /* no-op for additions */
 		}
 		else if (old != NULL) {
 			/*
 			 * ECMP sibling withdrawn: send a DELETE for the
 			 * old nexthop so kr_delete -> kroute_remove can
 			 * purge it from the multipath chain, then resend
-			 * the remaining best as a CHANGE.
+			 * the remaining ECMP sibling as primary.
 			 */
 			rde_send_kroute(rib, NULL, old);
-			rde_send_kroute(rib, newbest, NULL);
+			if (ep != NULL &&
+			    ep->dmetric == PREFIX_DMETRIC_ECMP)
+				rde_send_kroute(rib, ep, NULL);
+			else
+				rde_send_kroute(rib, newbest, NULL);
 		}
 	}
 

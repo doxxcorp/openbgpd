@@ -4432,11 +4432,33 @@ rde_softreconfig_sync_fib(struct rib_entry *re, void *bula)
 	/*
 	 * For ECMP prefixes, send the sibling first so the kroute process
 	 * can chain it before the best triggers the multipath install.
+	 * Check NEXTHOP_ECMP on the sibling (ep), not the best (p), because
+	 * the best may be LOCAL (self-originated via network statement) which
+	 * never passes through filter evaluation where fib-multipath is set.
+	 *
+	 * When best is LOCAL (nexthop 0.0.0.0), send the first ECMP sibling
+	 * as the primary kroute instead - it has a real nexthop and will
+	 * trigger the ECMP sibling loop to chain additional nexthops.
 	 */
 	ep = TAILQ_NEXT(p, rib_l);
 	if (ep != NULL && ep->dmetric == PREFIX_DMETRIC_ECMP &&
-	    (prefix_nhflags(p) & NEXTHOP_ECMP))
-		rde_send_kroute(re_rib(re), ep, NULL);
+	    (prefix_nhflags(ep) & NEXTHOP_ECMP)) {
+		if (prefix_nexthop(p) == NULL ||
+		    prefix_nexthop(p)->exit_nexthop.aid == AID_UNSPEC ||
+		    (prefix_nexthop(p)->exit_nexthop.aid == AID_INET &&
+		     prefix_nexthop(p)->exit_nexthop.v4.s_addr == INADDR_ANY) ||
+		    (prefix_nexthop(p)->exit_nexthop.aid == AID_INET6 &&
+		     IN6_IS_ADDR_UNSPECIFIED(
+		         &prefix_nexthop(p)->exit_nexthop.v6))) {
+			/* Best is LOCAL with unreachable nexthop - send first
+			 * ECMP sibling as primary (triggers multipath chain) */
+			rde_send_kroute(re_rib(re), ep, NULL);
+		} else {
+			rde_send_kroute(re_rib(re), ep, NULL);
+			rde_send_kroute(re_rib(re), p, NULL);
+		}
+		return;
+	}
 	rde_send_kroute(re_rib(re), p, NULL);
 }
 
