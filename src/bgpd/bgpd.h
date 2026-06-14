@@ -82,9 +82,8 @@
 #endif
 #define	CONFFILE			SYSCONFDIR "/bgpd.conf"
 
-#ifndef	RUNSTATEDIR
+#undef	RUNSTATEDIR
 #define	RUNSTATEDIR			"/var/run"
-#endif
 #define	SOCKET_NAME			RUNSTATEDIR "/bgpd.sock"
 
 #define	F_BGPD			0x0001

@@ -91,8 +91,6 @@ match from any prefix X.X.X.X/Y set fib-multipath
 
 ## Future Work
 
-- [ ] Upstream PR to `openbgpd-portable/openbgpd-portable` (maintainer: cjeker)
-- [ ] Clean up debug `log_warnx` statements before upstream submission
 - [ ] Consider `RTNH_F_ONLINK` for IPv4 multipath too (for consistency)
 - [ ] wg-server client hashing / CC pinning for VPN traffic
 - [ ] Integrate ECMP config generation into `dn-infra.go` `generate_inet_bgpd`

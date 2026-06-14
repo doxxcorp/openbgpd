@@ -1,10 +1,6 @@
 # OpenBGPd - Build, Test, and Deploy Guide
 
-This is the doxx.net fork of OpenBGPd portable (`doxxcorp/openbgpd`).
-Upstream: `openbgpd-portable/openbgpd-portable`.
-
-Our fork lives on the `main` branch and `feature/linux-ecmp-multipath` branch
-with patches for ECMP multipath FIB support and route re-announcement fixes.
+doxx.net OpenBGPd (`doxxcorp/openbgpd`) with ECMP multipath FIB support for Linux.
 
 ## Quick Reference
 
@@ -149,7 +145,7 @@ Flat tarball (no directory prefix) containing:
 bgpd            # the daemon binary (x86-64 ELF, not stripped)
 bgpctl          # the control client binary
 RELEASE         # version string, e.g. "9.2-doxx3"
-VERSION         # upstream version, e.g. "OpenBGPD 9.2"
+VERSION         # version string, e.g. "OpenBGPD 9.2"
 checksums.txt   # sha256 checksums of bgpd and bgpctl
 ```
 

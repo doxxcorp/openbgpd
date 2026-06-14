@@ -582,18 +582,25 @@ prefix_evaluate(struct rib_entry *re, struct prefix *new, struct prefix *old)
 		    (prefix_nhflags(ep) & NEXTHOP_ECMP))
 			ecmp = 1;
 		if (ecmp && ep != NULL &&
-		    ep->dmetric == PREFIX_DMETRIC_ECMP) {
+		    ep->dmetric == PREFIX_DMETRIC_ECMP &&
+		    new != ep && new != newbest) {
 			/*
-			 * ECMP set exists and is stable. Only touch FIB
-			 * when a member is withdrawn (old != NULL and was
-			 * an ECMP sibling). New paths joining the set are
-			 * handled by the delayed resync timer which
-			 * atomically rebuilds the full multipath FIB.
-			 * This prevents flip-flop from non-ECMP path
-			 * updates (iBGP from other PMs) clobbering the
-			 * multipath route.
+			 * ECMP set already exists and this update is NOT
+			 * the path that just joined or changed the set.
+			 * Stabilize: don't touch FIB for unrelated iBGP
+			 * updates that would clobber the multipath route.
 			 */
-			; /* no-op for additions */
+			; /* no-op for unrelated updates */
+		}
+		else if (ecmp && ep != NULL &&
+		    ep->dmetric == PREFIX_DMETRIC_ECMP &&
+		    (new == ep || new == newbest)) {
+			/*
+			 * New ECMP member joined or best path updated.
+			 * Install multipath in FIB immediately.
+			 */
+			rde_send_kroute(re_rib(re), ep, NULL);
+			rde_send_kroute(re_rib(re), newbest, NULL);
 		}
 		else if (old != NULL) {
 			/*

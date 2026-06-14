@@ -1,41 +1,23 @@
-<h1><a href="https://www.openbgpd.org/"><img src="https://www.openbsd.org/openbgpd/images/openbgpd.gif"></a></h1>
+# OpenBGPd - doxx.net
 
-This is a port of OpenBGPD to other operating systems. It is based on
-portability code from the OpenNTPD, OpenSSH, and LibreSSL portable projects.
+doxx.net OpenBGPd with ECMP multipath FIB support for Linux.
 
-OpenBGPD has a web site at https://www.openbgpd.org/
+Repository: `github.com:doxxcorp/openbgpd.git`
 
-<a href="https://repology.org/project/openbgpd/versions">
-    <img src="https://repology.org/badge/vertical-allrepos/openbgpd.svg?exclude_unsupported=1" alt="Packaging status" align="right">
-</a>
+## Platform
 
-The current portable tree can be found at
-https://github.com/openbgpd-portable/openbgpd-portable
+Linux x86-64 (Debian/Ubuntu). All doxx.net servers.
 
-[![Build Status](https://github.com/openbgpd-portable/openbgpd-portable/workflows/Build%20CI/badge.svg)](https://github.com/openbgpd-portable/openbgpd-portable/actions)
+## Build
 
-Platform Requirements
----------------------
+```bash
+apt install build-essential automake autoconf libtool bison pkg-config libmnl-dev
+./autogen.sh && ./configure && make -j4
+```
 
-At the time of writing the portable version is known to build and work on actively maintained versions of:
+Binaries: `src/bgpd/bgpd` (daemon), `src/bgpctl/bgpctl` (control client).
 
- - Alpine
- - CentOS/RHEL/Rocky
- - Debian
- - Fedora
- - FreeBSD
- - NetBSD
- - OpenBSD
- - openSUSE
- - SLE
- - Ubuntu
+## Documentation
 
-OpenBGPD may work on other operating systems, newer and older, but the above
-ones are tested regularly by the developer.
-
-Reports (success or otherwise) are welcome. You may report bugs or submit pull
-requests at the GitHub project: https://github.com/openbgpd-portable
-
-Thanks,
-  Claudio Jeker <claudio at openbsd.org> and
-  Brent Cook <bcook at openbsd.org>.
+- [DEPLOY_AND_TESTING.md](DEPLOY_AND_TESTING.md) - build, test, deploy guide
+- [ECMP_bugs.md](ECMP_bugs.md) - ECMP FIB install bug tracking and debug plan
