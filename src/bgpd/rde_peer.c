@@ -429,6 +429,7 @@ void
 peer_up(struct rde_peer *peer, struct session_up *sup)
 {
 	u_int	 i;
+	int force_sync = 1;
 
 	if (peer->state == PEER_ERR) {
 		/*
@@ -439,16 +440,18 @@ peer_up(struct rde_peer *peer, struct session_up *sup)
 	}
 
 	/*
-	 * Always do a full Loc-RIB walk on session re-establishment.
-	 * The peer_blast() optimization assumed Adj-RIB-Out stayed in
-	 * sync, but bgpctli reload can flush Adj-RIB-Out entries via
-	 * softreconfig without rebuilding them for all peers. A
-	 * subsequent session flap with force_sync=0 would then blast
-	 * an empty or stale Adj-RIB-Out, causing the peer to miss
-	 * routes that exist in Loc-RIB. Always re-walking Loc-RIB
-	 * guarantees correctness at the cost of a brief CPU spike on
-	 * session establishment.
+	 * Check if no value changed during flap to decide if the RIB
+	 * is in sync. The capa check is maybe too strict but it should
+	 * not matter for normal operation.
 	 */
+	if (memcmp(&peer->remote_addr, &sup->remote_addr,
+	    sizeof(sup->remote_addr)) == 0 &&
+	    memcmp(&peer->local_v4_addr, &sup->local_v4_addr,
+	    sizeof(sup->local_v4_addr)) == 0 &&
+	    memcmp(&peer->local_v6_addr, &sup->local_v6_addr,
+	    sizeof(sup->local_v6_addr)) == 0 &&
+	    memcmp(&peer->capa, &sup->capa, sizeof(sup->capa)) == 0)
+		force_sync = 0;
 
 	peer->remote_addr = sup->remote_addr;
 	peer->local_v4_addr = sup->local_v4_addr;
@@ -470,9 +473,16 @@ peer_up(struct rde_peer *peer, struct session_up *sup)
 	}
 	peer->state = PEER_UP;
 
-	for (i = AID_MIN; i < AID_MAX; i++) {
-		if (peer->capa.mp[i])
-			peer_dump(peer, i);
+	if (!force_sync) {
+		for (i = AID_MIN; i < AID_MAX; i++) {
+			if (peer->capa.mp[i])
+				peer_blast(peer, i);
+		}
+	} else {
+		for (i = AID_MIN; i < AID_MAX; i++) {
+			if (peer->capa.mp[i])
+				peer_dump(peer, i);
+		}
 	}
 }
 
