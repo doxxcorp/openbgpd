@@ -241,8 +241,19 @@ main(int argc, char *argv[])
 		exit(1);
 	}
 
+	/*
+	 * doxx.net: partial listener failure is not fatal. Listeners are
+	 * only needed for inbound sessions; bgpd initiates outbound
+	 * sessions without them. prepare_listeners() already logs each
+	 * failed bind and continues with the listeners that did bind
+	 * (and with IP_FREEBIND, absent-address binds succeed anyway).
+	 * Upstream exits here, which forced hand-editing configs during
+	 * the Jul 21 2026 MIA1 recovery whenever a carrier address was
+	 * missing at boot.
+	 */
 	if (prepare_listeners(conf) == -1)
-		exit(1);
+		log_warnx("some listeners failed to bind, continuing "
+		    "with remaining listeners");
 
 	log_init(debug, LOG_DAEMON);
 	log_setverbose(cmd_opts & BGPD_OPT_VERBOSE);
@@ -578,8 +589,16 @@ reconfigure(const char *conffile, struct bgpd_config *conf)
 
 	merge_config(conf, new_conf);
 
+	/*
+	 * doxx.net: do NOT abort the reload over a listener bind
+	 * failure. Upstream returns here BEFORE send_config(), which
+	 * silently discards the entire reloaded config (filters, peers,
+	 * everything) while bgpctl still reports the reload request as
+	 * sent. A missing listen address must not veto policy changes.
+	 */
 	if (prepare_listeners(conf) == -1)
-		return (1);
+		log_warnx("some listeners failed to bind, "
+		    "continuing reload with remaining listeners");
 
 	if (control_setup(conf) == -1)
 		return (1);
