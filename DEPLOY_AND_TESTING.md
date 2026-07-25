@@ -188,15 +188,34 @@ The infra API serves these via:
 
 ## Key Patches (doxx.net fork)
 
-### peer_up() full Loc-RIB walk (9.2-doxx3)
+### peer_up() Adj-RIB-Out resync (a23bb98, 9.2-doxx4)
 
-**File:** `src/bgpd/rde_peer.c`
+**Files:** `src/bgpd/rde_peer.c`, `src/bgpd/rde_adjout.c`, `src/bgpd/rde.h`
 
-Removed the `peer_blast()` optimization in `peer_up()` that skipped full
-Loc-RIB walks when a peer session re-established with unchanged capabilities.
-This optimization assumed Adj-RIB-Out stayed in sync, but `bgpctli reload`
-can flush Adj-RIB-Out without rebuilding for all peers. Always using
-`peer_dump()` guarantees all routes are re-announced on session establishment.
+Fixes the silent re-announcement bug (pao1 June 11, mia1 July 22 P0s):
+when a peer daemon restarts, the session re-establishes with changed
+parameters (typically the graceful restart capability), which sent
+`peer_up()` down the `peer_dump()` path. `peer_dump()` generates deltas
+against the surviving Adj-RIB-Out, so a populated tree meant almost
+nothing was re-sent to a peer whose table was actually empty.
+
+The fix: on the force_sync path, silently flush the Adj-RIB-Out first
+(new `adjout_prefix_flush()`, no wire withdraws), then dump the full
+Loc-RIB per AID. An `adjout_dirty` flag persists across interrupted
+resyncs. `peer_blast()` remains the fast path for unchanged flaps.
+Every establishment now logs "replaying Adj-RIB-Out" (blast) or
+"full Adj-RIB-Out resync (<reason>)" (flush+dump).
+
+NOTE: an earlier attempt (764873d, June 13) forced `peer_dump()` for
+EVERY reconnect - that made every flap silent and was reverted. Do not
+reintroduce it.
+
+### Graceful listener binds (d7f62d5)
+
+`IP_FREEBIND`/`IPV6_FREEBIND` on listeners + non-fatal partial bind at
+startup AND reload (upstream reload silently discarded the whole config
+on one failed bind). Allows configs with listen addresses that are not
+yet up (dark carrier ports, v6 discovery issues).
 
 ### ECMP multipath FIB support
 
