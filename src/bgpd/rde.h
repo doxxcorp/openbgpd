@@ -118,6 +118,8 @@ struct rde_peer {
 	uint8_t				 reconf_rib;	/* rib changed */
 	uint8_t				 throttled;
 	uint8_t				 flags;
+	uint8_t				 adjout_dirty;	/* needs full resync */
+	uint8_t				 adjout_resync;	/* AID dumps left */
 };
 
 struct rde_aspa;
@@ -776,6 +778,8 @@ struct adjout_prefix	*adjout_prefix_next(struct rde_peer *,
 void		 adjout_prefix_update(struct adjout_prefix *, struct rde_peer *,
 		    struct filterstate *, struct pt_entry *, uint32_t);
 void		 adjout_prefix_withdraw(struct rde_peer *, struct pt_entry *,
+		    struct adjout_prefix *);
+void		 adjout_prefix_flush(struct rde_peer *, struct pt_entry *,
 		    struct adjout_prefix *);
 void		 adjout_prefix_reaper(struct rde_peer *);
 void		 adjout_prefix_dump_cleanup(struct rib_context *);

@@ -586,6 +586,24 @@ adjout_prefix_withdraw(struct rde_peer *peer, struct pt_entry *pte,
 	peer->stats.prefix_out_cnt--;
 }
 
+/*
+ * Remove a prefix from the Adj-RIB-Out WITHOUT queueing a withdraw on the
+ * wire. Used by the peer_up() full resync: the freshly established session
+ * never received these prefixes, so withdraws would be pure waste (and on
+ * full-table PM-PM sessions, ~1M useless messages). doxx.net fork addition
+ * for the silent re-announcement fix (June 11 / July 22 2026 incidents).
+ */
+void
+adjout_prefix_flush(struct rde_peer *peer, struct pt_entry *pte,
+    struct adjout_prefix *p)
+{
+	if (bitmap_test(&p->peermap, peer->adjout_bid) == 0)
+		fatalx("%s: king bula is unhappy", __func__);
+
+	adjout_prefix_unlink(p, pte, peer);
+	peer->stats.prefix_out_cnt--;
+}
+
 void
 adjout_prefix_reaper(struct rde_peer *peer)
 {

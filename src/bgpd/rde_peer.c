@@ -423,11 +423,58 @@ peer_flush_upcall(struct rib_entry *re, void *arg)
 }
 
 /*
+ * RIB walker callback for the peer_up() Adj-RIB-Out resync flush.
+ * Remove every prefix this peer holds in the Adj-RIB-Out without queueing
+ * withdraws - the freshly established session never received them.
+ */
+static void
+peer_up_flush_upcall(struct rde_peer *peer, struct pt_entry *pte,
+    struct adjout_prefix *p, void *ptr)
+{
+	do {
+		adjout_prefix_flush(peer, pte, p);
+	} while ((p = adjout_prefix_first(peer, pte)) != NULL);
+}
+
+/*
+ * Adj-RIB-Out resync flush finished. If the session is still up, dump the
+ * full Loc-RIB for every negotiated AID. adjout_dirty is cleared in
+ * peer_blast_done() once the last AID dump completed. Note that dump
+ * contexts fire their done callback on termination too (rib_dump_free),
+ * so a session that died mid-flush lands here with state != PEER_UP and
+ * adjout_dirty stays set for the next session.
+ */
+static void
+peer_up_flush_done(void *ptr, uint8_t aid)
+{
+	struct rde_peer	*peer = ptr;
+	u_int		 i;
+
+	if (peer->state != PEER_UP)
+		return;
+
+	peer->adjout_resync = 0;
+	for (i = AID_MIN; i < AID_MAX; i++) {
+		if (peer->capa.mp[i])
+			peer->adjout_resync++;
+	}
+	if (peer->adjout_resync == 0) {
+		peer->adjout_dirty = 0;
+		return;
+	}
+	for (i = AID_MIN; i < AID_MAX; i++) {
+		if (peer->capa.mp[i])
+			peer_dump(peer, i);
+	}
+}
+
+/*
  * Session got established, bring peer up, load RIBs do initial table dump.
  */
 void
 peer_up(struct rde_peer *peer, struct session_up *sup)
 {
+	const char *reason = NULL;
 	u_int	 i;
 	int force_sync = 1;
 
@@ -445,12 +492,23 @@ peer_up(struct rde_peer *peer, struct session_up *sup)
 	 * not matter for normal operation.
 	 */
 	if (memcmp(&peer->remote_addr, &sup->remote_addr,
-	    sizeof(sup->remote_addr)) == 0 &&
-	    memcmp(&peer->local_v4_addr, &sup->local_v4_addr,
-	    sizeof(sup->local_v4_addr)) == 0 &&
-	    memcmp(&peer->local_v6_addr, &sup->local_v6_addr,
-	    sizeof(sup->local_v6_addr)) == 0 &&
-	    memcmp(&peer->capa, &sup->capa, sizeof(sup->capa)) == 0)
+	    sizeof(sup->remote_addr)) != 0)
+		reason = "remote address changed";
+	else if (memcmp(&peer->local_v4_addr, &sup->local_v4_addr,
+	    sizeof(sup->local_v4_addr)) != 0)
+		reason = "local IPv4 address changed";
+	else if (memcmp(&peer->local_v6_addr, &sup->local_v6_addr,
+	    sizeof(sup->local_v6_addr)) != 0)
+		reason = "local IPv6 address changed";
+	else if (memcmp(&peer->capa, &sup->capa, sizeof(sup->capa)) != 0) {
+		if (memcmp(&peer->capa.grestart, &sup->capa.grestart,
+		    sizeof(sup->capa.grestart)) != 0)
+			reason = "graceful restart capability changed";
+		else
+			reason = "capabilities changed";
+	} else if (peer->adjout_dirty)
+		reason = "previous Adj-RIB-Out resync incomplete";
+	else
 		force_sync = 0;
 
 	peer->remote_addr = sup->remote_addr;
@@ -474,15 +532,35 @@ peer_up(struct rde_peer *peer, struct session_up *sup)
 	peer->state = PEER_UP;
 
 	if (!force_sync) {
+		log_peer_info(&peer->conf,
+		    "session re-established, replaying Adj-RIB-Out");
 		for (i = AID_MIN; i < AID_MAX; i++) {
 			if (peer->capa.mp[i])
 				peer_blast(peer, i);
 		}
 	} else {
-		for (i = AID_MIN; i < AID_MAX; i++) {
-			if (peer->capa.mp[i])
-				peer_dump(peer, i);
-		}
+		/*
+		 * The peer's table may not match our Adj-RIB-Out model
+		 * (daemon restart on the far side, capability change, or
+		 * an earlier resync was cut short). peer_dump() only
+		 * generates deltas against the existing Adj-RIB-Out, so
+		 * dumping into a populated tree sends almost nothing to a
+		 * peer whose table is actually empty - the silent
+		 * re-announcement bug (pao1 June 11, mia1 July 22 2026).
+		 * Flush the Adj-RIB-Out first (silently - the peer never
+		 * received these prefixes), then dump the full Loc-RIB.
+		 * adjout_dirty stays set until every AID dump completes,
+		 * so an interrupted resync forces a new flush+dump on the
+		 * next session establishment.
+		 */
+		log_peer_info(&peer->conf,
+		    "full Adj-RIB-Out resync (%s)", reason);
+		peer->adjout_dirty = 1;
+		peer->throttled = 1;
+		if (adjout_prefix_dump_new(peer, AID_UNSPEC,
+		    RDE_RUNNER_ROUNDS, peer, peer_up_flush_upcall,
+		    peer_up_flush_done, NULL) == -1)
+			fatal("%s: adjout_prefix_dump_new", __func__);
 	}
 }
 
@@ -502,6 +580,13 @@ peer_down(struct rde_peer *peer)
 	rib_dump_terminate(peer);
 	adjout_peer_flush_pending(peer);
 	peer_imsg_flush(peer);
+
+	/*
+	 * An in-flight Adj-RIB-Out resync was terminated above; the
+	 * counter must not survive into the next session. adjout_dirty
+	 * intentionally persists so the next peer_up() redoes the resync.
+	 */
+	peer->adjout_resync = 0;
 
 	/* flush Adj-RIB-In */
 	peer_flush(peer, AID_UNSPEC, monotime_clear());
@@ -635,6 +720,22 @@ peer_blast_done(void *ptr, uint8_t aid)
 	peer->throttled = 0;
 	if (peer->capa.grestart.restart)
 		pend_eor_add(peer, aid);
+
+	/*
+	 * Adj-RIB-Out resync accounting (see peer_up). Dump contexts fire
+	 * their done callback on termination too, so only count completions
+	 * while the session is still up - a terminated resync leaves
+	 * adjout_dirty set so the next session establishment redoes the
+	 * flush+dump.
+	 */
+	if (peer->adjout_resync > 0) {
+		if (peer->state != PEER_UP) {
+			peer->adjout_resync = 0;
+			return;
+		}
+		if (--peer->adjout_resync == 0)
+			peer->adjout_dirty = 0;
+	}
 }
 
 /*
