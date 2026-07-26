@@ -81,6 +81,8 @@ static void	 rde_softreconfig_done(void);
 static void	 rde_softreconfig_sync_reeval(struct rib_entry *, void *);
 static void	 rde_softreconfig_sync_fib(struct rib_entry *, void *);
 static void	 rde_softreconfig_sync_done(void *, uint8_t);
+static void	 rde_ecmp_sync_fib_fast(struct rib_entry *, void *);
+static void	 rde_ecmp_sync_done(void *, uint8_t);
 static void	 rde_rpki_reload(void);
 static int	 rde_roa_reload(void);
 static int	 rde_aspa_reload(void);
@@ -112,6 +114,7 @@ static int	 ovs_match(uint8_t, uint32_t);
 static int	 avs_match(uint8_t, uint32_t);
 
 static monotime_t	ecmp_fib_sync_deadline;
+static monotime_t	ecmp_fib_sync_ibgp_deadline;
 
 static struct imsgbuf		*ibuf_se;
 static struct imsgbuf		*ibuf_se_ctl;
@@ -362,10 +365,31 @@ rde_main(int debug, int verbose)
 		/* commit pftable once per poll loop */
 		rde_commit_pftable();
 
-		/* one-shot delayed ECMP fib sync after initial convergence */
+		/*
+		 * Delayed ECMP fib sync, two triggers:
+		 *
+		 * - ecmp_fib_sync_deadline: 20s backstop, re-armed by every
+		 *   session-up and softreconfig completion. Runs the full
+		 *   FIB heal once convergence has settled.
+		 *
+		 * - ecmp_fib_sync_ibgp_deadline: armed 2s after each iBGP
+		 *   session-up. The service/VIP ECMP prefixes come from
+		 *   iBGP peers whose small tables converge in well under a
+		 *   second, but the VIP re-export to transit goes out the
+		 *   moment those routes hit the Loc-RIB. Waiting for the
+		 *   20s backstop leaves the prefixes announced but not
+		 *   forwardable: an inbound blackhole on every daemon
+		 *   start (defect-1 ingress, BT-20260726-001). eBGP
+		 *   session-ups do not touch this deadline, so a late
+		 *   transit session cannot push the fast sync out.
+		 *
+		 * The full backstop covers the fast sync, so when it fires
+		 * both deadlines are cleared.
+		 */
 		if (monotime_valid(ecmp_fib_sync_deadline) &&
 		    monotime_cmp(getmonotime(), ecmp_fib_sync_deadline) >= 0) {
 			ecmp_fib_sync_deadline = monotime_clear();
+			ecmp_fib_sync_ibgp_deadline = monotime_clear();
 			log_info("running delayed ECMP fib resync");
 			for (i = 0; i < rib_size; i++) {
 				struct rib *rib = rib_byid(i);
@@ -376,7 +400,24 @@ rde_main(int debug, int verbose)
 					rib_dump_new(i, AID_UNSPEC,
 					    RDE_RUNNER_ROUNDS, rib,
 					    rde_softreconfig_sync_fib,
-					    rde_softreconfig_sync_done, NULL);
+					    rde_ecmp_sync_done, NULL);
+			}
+		} else if (monotime_valid(ecmp_fib_sync_ibgp_deadline) &&
+		    monotime_cmp(getmonotime(),
+		    ecmp_fib_sync_ibgp_deadline) >= 0) {
+			ecmp_fib_sync_ibgp_deadline = monotime_clear();
+			log_info("running fast ECMP fib sync "
+			    "(iBGP converged)");
+			for (i = 0; i < rib_size; i++) {
+				struct rib *rib = rib_byid(i);
+				if (rib == NULL)
+					continue;
+				if ((rib->flags &
+				    (F_RIB_NOFIB | F_RIB_NOEVALUATE)) == 0)
+					rib_dump_new(i, AID_UNSPEC,
+					    RDE_RUNNER_ROUNDS, rib,
+					    rde_ecmp_sync_fib_fast,
+					    rde_ecmp_sync_done, NULL);
 			}
 		}
 	}
@@ -532,6 +573,18 @@ rde_dispatch_imsg_session(struct imsgbuf *imsgbuf)
 			/* Schedule ECMP fib resync after peer reconverges */
 			ecmp_fib_sync_deadline = monotime_add(getmonotime(),
 			    monotime_from_sec(20));
+			/*
+			 * iBGP peers deliver the service/VIP ECMP routes
+			 * and converge fast. Arm the fast sync so kernel
+			 * multipath for those prefixes is installed
+			 * seconds after establishment instead of 20s
+			 * after the last session-up (defect-1 ingress
+			 * fix). Re-armed per iBGP session-up: fires 2s
+			 * after the last one.
+			 */
+			if (!peer->conf.ebgp)
+				ecmp_fib_sync_ibgp_deadline = monotime_add(
+				    getmonotime(), monotime_from_sec(2));
 			break;
 		case IMSG_SESSION_DOWN:
 			if ((peer = peer_get(peerid)) == NULL) {
@@ -4477,6 +4530,46 @@ rde_softreconfig_sync_done(void *arg, uint8_t aid)
 	/* check if other dumps are still running */
 	if (--softreconfig == 0)
 		rde_softreconfig_done();
+}
+
+/*
+ * Fast ECMP-only variant of the FIB sync, run shortly after iBGP
+ * convergence (ecmp_fib_sync_ibgp_deadline). Prefixes without an ECMP
+ * sibling set were already installed correctly by the incremental path
+ * when they arrived; skipping them keeps this walk cheap enough to run
+ * while eBGP full tables are still converging.
+ */
+static void
+rde_ecmp_sync_fib_fast(struct rib_entry *re, void *arg)
+{
+	struct prefix *p, *ep;
+
+	if ((p = prefix_best(re)) == NULL)
+		return;
+
+	ep = TAILQ_NEXT(p, rib_l);
+	if (ep == NULL || ep->dmetric != PREFIX_DMETRIC_ECMP ||
+	    (prefix_nhflags(ep) & NEXTHOP_ECMP) == 0)
+		return;
+
+	rde_softreconfig_sync_fib(re, arg);
+}
+
+/*
+ * Done callback for the timer-driven ECMP fib syncs. Unlike
+ * rde_softreconfig_sync_done this must NOT touch the softreconfig
+ * counter: these dumps run outside any softreconfig cycle, and
+ * decrementing a counter they never incremented can fire
+ * rde_softreconfig_done() early if a sync completes while a config
+ * reload is mid-flight (spurious IMSG_RECONF_DONE, incomplete
+ * softreconfig out).
+ */
+static void
+rde_ecmp_sync_done(void *arg, uint8_t aid)
+{
+	struct rib *rib = arg;
+
+	log_info("ECMP fib sync done for %s", rib->name);
 }
 
 /*
