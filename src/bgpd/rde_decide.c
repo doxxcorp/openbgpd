@@ -20,43 +20,11 @@
 #include <sys/types.h>
 #include <sys/queue.h>
 
-#include <arpa/inet.h>
 #include <string.h>
 
 #include "bgpd.h"
 #include "rde.h"
 #include "log.h"
-
-/*
- * KDIAG: temporary defect-2 diagnostics (brain task BT-20260725-006).
- * Local address formatters (log_addr shares a static buffer, unsafe for
- * multi-address log lines). Tagged "KDIAG:" for easy grep and removal.
- */
-static void
-kdiag_addr(const struct bgpd_addr *a, char *buf, size_t len)
-{
-	buf[0] = '\0';
-	switch (a->aid) {
-	case AID_INET:
-		inet_ntop(AF_INET, &a->v4, buf, len);
-		break;
-	case AID_INET6:
-		inet_ntop(AF_INET6, &a->v6, buf, len);
-		break;
-	default:
-		strlcpy(buf, "-", len);
-		break;
-	}
-}
-
-static const char *
-kdiag_nhstr(struct prefix *p, char *buf, size_t len)
-{
-	if (p == NULL || prefix_nexthop(p) == NULL)
-		return "none";
-	kdiag_addr(&prefix_nexthop(p)->exit_nexthop, buf, len);
-	return buf;
-}
 
 int	prefix_cmp(struct prefix *, struct prefix *, int *);
 void	prefix_set_dmetric(struct prefix *, struct prefix *);
@@ -631,15 +599,6 @@ prefix_evaluate(struct rib_entry *re, struct prefix *new, struct prefix *old)
 			 * New ECMP member joined or best path updated.
 			 * Install multipath in FIB immediately.
 			 */
-			{
-				struct bgpd_addr kdaddr;
-				char kdp[64];
-
-				pt_getaddr(newbest->pt, &kdaddr);
-				kdiag_addr(&kdaddr, kdp, sizeof(kdp));
-				log_warnx("KDIAG: ecmp-join reinstall %s/%u",
-				    kdp, newbest->pt->prefixlen);
-			}
 			rde_send_kroute(re_rib(re), ep, NULL);
 			rde_send_kroute(re_rib(re), newbest, NULL);
 		}
@@ -651,57 +610,25 @@ prefix_evaluate(struct rib_entry *re, struct prefix *new, struct prefix *old)
 			 * the old nexthop then resend the remaining ECMP
 			 * sibling (or the best) so kr_delete -> kroute_remove
 			 * purges just the withdrawn path from the chain.
+			 *
+			 * DEFECT-2 FIX (2026-07-26): this branch MUST stay
+			 * gated on ecmp. A non-ECMP path withdrawn while the
+			 * best is unchanged (e.g. a localpref backup default
+			 * withdrawn while the primary survives) needs NO FIB
+			 * action - the best route is already installed and
+			 * stock OpenBGPD does nothing. The pre-fix code fell
+			 * in here unconditionally and issued a whole-route
+			 * DELETE + reinstall; when the reinstall's nexthop
+			 * failed to resolve (poisoned v6 nexthop slot) the
+			 * surviving best-path kernel route was left deleted:
+			 * the ::/0 v6-default outage on cc2.mia1.
 			 */
-			{
-				struct bgpd_addr kdaddr;
-				char kdp[64], kdo[64], kdn[64];
-
-				pt_getaddr(newbest->pt, &kdaddr);
-				kdiag_addr(&kdaddr, kdp, sizeof(kdp));
-				log_warnx("KDIAG: ecmp-sibling-withdraw "
-				    "%s/%u: withdrawn nh %s, best nh %s "
-				    "(ecmp set) - rebuild multipath", kdp,
-				    newbest->pt->prefixlen,
-				    kdiag_nhstr(old, kdo, sizeof(kdo)),
-				    kdiag_nhstr(newbest, kdn, sizeof(kdn)));
-			}
 			rde_send_kroute(rib, NULL, old);
 			if (ep != NULL &&
 			    ep->dmetric == PREFIX_DMETRIC_ECMP)
 				rde_send_kroute(rib, ep, NULL);
 			else
 				rde_send_kroute(rib, newbest, NULL);
-		}
-		else if (old != NULL) {
-			/*
-			 * DEFECT-2 FIX (2026-07-26): a NON-ECMP path was
-			 * withdrawn while the best is unchanged (e.g. a
-			 * localpref backup default withdrawn while the
-			 * primary survives). The best route is already
-			 * installed correctly in the kernel, so there is
-			 * nothing to do - stock OpenBGPD does nothing here.
-			 *
-			 * The previous fork code fell into the ECMP-sibling
-			 * path unconditionally and issued a whole-route
-			 * DELETE + reinstall. When the reinstall's nexthop
-			 * failed to resolve (poisoned v6 nexthop slot), the
-			 * surviving best-path kernel route was left deleted -
-			 * the ::/0 v6-default outage. Leaving the FIB
-			 * untouched for a non-ECMP backup withdrawal is the
-			 * fix.
-			 */
-			{
-				struct bgpd_addr kdaddr;
-				char kdp[64], kdo[64];
-
-				pt_getaddr(newbest->pt, &kdaddr);
-				kdiag_addr(&kdaddr, kdp, sizeof(kdp));
-				log_warnx("KDIAG: backup-withdraw NO-OP "
-				    "%s/%u: withdrawn nh %s, best unchanged "
-				    "(non-ecmp) - FIB untouched (defect-2 fix)",
-				    kdp, newbest->pt->prefixlen,
-				    kdiag_nhstr(old, kdo, sizeof(kdo)));
-			}
 		}
 	}
 

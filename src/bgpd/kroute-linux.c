@@ -214,15 +214,15 @@ RB_GENERATE(kif_tree, kif, entry, kif_compare)
 #define KT2KNT(x)	(&(ktable_get((x)->nhtableid)->knt))
 
 /*
- * KDIAG: temporary defect-2 diagnostics (brain task BT-20260725-006).
- * Goal: correlate kernel netlink NACKs with the exact request that caused
- * them, and make silent FIB install failures + cross-daemon kernel slot
- * modifications visible. Every line is tagged "KDIAG:" for easy grep and
- * later removal. No behavior changes.
+ * Netlink NACK decode: the kernel rejecting a route request is always
+ * actionable, but the NLMSG_ERROR only carries the sequence number. Keep
+ * a small ring of recent requests keyed by nlmsg_seq so the rejection can
+ * be logged with the prefix, nexthop, action, and encoding that caused it.
+ * Recording is silent; the only log output is on an actual kernel reject.
  */
-#define KDIAG_RING	64
+#define NLREQ_RING	64
 
-struct kdiag_req {
+struct nlreq {
 	uint32_t		 seq;
 	int			 action;
 	uint8_t			 prefixlen;
@@ -232,10 +232,10 @@ struct kdiag_req {
 	char			 enc[24];
 };
 
-static struct kdiag_req	kdiag_ring[KDIAG_RING];
+static struct nlreq	nlreq_ring[NLREQ_RING];
 
 static const char *
-kdiag_action(int action)
+nlreq_action(int action)
 {
 	switch (action) {
 	case RTM_ADD:
@@ -249,8 +249,12 @@ kdiag_action(int action)
 	}
 }
 
+/*
+ * Local address formatter: log_addr() shares a static buffer, which is
+ * unsafe for log lines carrying more than one address.
+ */
 static void
-kdiag_addrstr(const struct bgpd_addr *a, char *buf, size_t len)
+nl_addrstr(const struct bgpd_addr *a, char *buf, size_t len)
 {
 	buf[0] = '\0';
 	switch (a->aid) {
@@ -267,10 +271,10 @@ kdiag_addrstr(const struct bgpd_addr *a, char *buf, size_t len)
 }
 
 static void
-kdiag_record(uint32_t seq, int action, const struct kroute_full *kf,
+nlreq_record(uint32_t seq, int action, const struct kroute_full *kf,
     uint16_t ifidx, const char *enc)
 {
-	struct kdiag_req	*r = &kdiag_ring[seq % KDIAG_RING];
+	struct nlreq	*r = &nlreq_ring[seq % NLREQ_RING];
 
 	r->seq = seq;
 	r->action = action;
@@ -281,48 +285,31 @@ kdiag_record(uint32_t seq, int action, const struct kroute_full *kf,
 	strlcpy(r->enc, enc, sizeof(r->enc));
 }
 
-static void
-kdiag_install_failed(struct ktable *kt, const struct kroute_full *kf,
-    const char *ctx)
-{
-	char	 p[64], n[64];
-
-	/* decoupled FIB legitimately skips installs - not a failure */
-	if (!kt->fib_sync)
-		return;
-
-	kdiag_addrstr(&kf->prefix, p, sizeof(p));
-	kdiag_addrstr(&kf->nexthop, n, sizeof(n));
-	log_warnx("KDIAG: install FAILED (%s) %s/%u via %s - mirror entry "
-	    "kept without F_BGPD_INSERTED (phantom)", ctx, p, kf->prefixlen,
-	    n);
-}
-
 /*
  * Custom NLMSG_ERROR handler: mirrors libmnl default semantics
  * (ACK -> STOP, error -> errno + MNL_CB_ERROR) but logs errno plus the
  * originating request from the ring buffer before returning.
  */
 static int
-kdiag_nlmsg_error_cb(const struct nlmsghdr *nlh, void *data)
+nl_error_cb(const struct nlmsghdr *nlh, void *data)
 {
 	const struct nlmsgerr	*err = mnl_nlmsg_get_payload(nlh);
-	struct kdiag_req	*r;
+	struct nlreq		*r;
 	char			 p[64], n[64];
 
 	if (err->error == 0)
 		return MNL_CB_STOP;	/* plain ACK */
 
-	r = &kdiag_ring[err->msg.nlmsg_seq % KDIAG_RING];
+	r = &nlreq_ring[err->msg.nlmsg_seq % NLREQ_RING];
 	if (r->seq == err->msg.nlmsg_seq && r->seq != 0) {
-		kdiag_addrstr(&r->prefix, p, sizeof(p));
-		kdiag_addrstr(&r->nexthop, n, sizeof(n));
-		log_warnx("KDIAG: netlink NACK %s (errno %d) for %s %s/%u "
+		nl_addrstr(&r->prefix, p, sizeof(p));
+		nl_addrstr(&r->nexthop, n, sizeof(n));
+		log_warnx("netlink NACK %s (errno %d) for %s %s/%u "
 		    "via %s enc=%s ifidx=%u seq=%u", strerror(-err->error),
-		    -err->error, kdiag_action(r->action), p, r->prefixlen,
+		    -err->error, nlreq_action(r->action), p, r->prefixlen,
 		    n, r->enc, r->ifidx, r->seq);
 	} else
-		log_warnx("KDIAG: netlink NACK %s (errno %d) for untracked "
+		log_warnx("netlink NACK %s (errno %d) for untracked "
 		    "seq=%u type=%u", strerror(-err->error), -err->error,
 		    err->msg.nlmsg_seq, err->msg.nlmsg_type);
 
@@ -331,13 +318,13 @@ kdiag_nlmsg_error_cb(const struct nlmsghdr *nlh, void *data)
 }
 
 static int
-kdiag_ctl_noop(const struct nlmsghdr *nlh, void *data)
+nl_ctl_noop(const struct nlmsghdr *nlh, void *data)
 {
 	return MNL_CB_OK;
 }
 
 static int
-kdiag_ctl_stop(const struct nlmsghdr *nlh, void *data)
+nl_ctl_stop(const struct nlmsghdr *nlh, void *data)
 {
 	return MNL_CB_STOP;
 }
@@ -346,11 +333,11 @@ kdiag_ctl_stop(const struct nlmsghdr *nlh, void *data)
  * Explicit control-message callbacks so behavior stays identical to the
  * libmnl defaults for every control type regardless of library version.
  */
-static const mnl_cb_t kdiag_ctl_cbs[NLMSG_MIN_TYPE] = {
-	[NLMSG_NOOP]	= kdiag_ctl_noop,
-	[NLMSG_ERROR]	= kdiag_nlmsg_error_cb,
-	[NLMSG_DONE]	= kdiag_ctl_stop,
-	[NLMSG_OVERRUN]	= kdiag_ctl_noop,
+static const mnl_cb_t nl_ctl_cbs[NLMSG_MIN_TYPE] = {
+	[NLMSG_NOOP]	= nl_ctl_noop,
+	[NLMSG_ERROR]	= nl_error_cb,
+	[NLMSG_DONE]	= nl_ctl_stop,
+	[NLMSG_OVERRUN]	= nl_ctl_noop,
 };
 
 /* seq num 0 is special, so skip it */
@@ -586,13 +573,11 @@ kr_change(u_int rtableid, struct kroute_full *kf)
 	kf->flags |= F_BGPD;
 	kf->priority = RTP_MINE;
 	if (!knexthop_true_nexthop(kt, kf)) {
-		char p[64], n[64];
-
-		kdiag_addrstr(&kf->prefix, p, sizeof(p));
-		kdiag_addrstr(&kf->nexthop, n, sizeof(n));
-		log_warnx("KDIAG: kr_change %s/%u nexthop %s: true_nexthop "
-		    "FAILED%s - converting install to remove", p,
-		    kf->prefixlen, n, (kf->flags & F_ECMP) ? " (ecmp)" : "");
+		if (kf->flags & F_ECMP)
+			log_warnx("ECMP: kr_change %s/%u nexthop %s "
+			    "true_nexthop failed, removing",
+			    log_addr(&kf->prefix), kf->prefixlen,
+			    log_addr(&kf->nexthop));
 		return kroute_remove(kt, kf, 1);
 	}
 	switch (kf->prefix.aid) {
@@ -653,8 +638,6 @@ kr4_change(struct ktable *kt, struct kroute_full *kf)
 
 		if (send_rtmsg(RTM_CHANGE, kt, kf))
 			krn->flags |= F_BGPD_INSERTED;
-		else
-			kdiag_install_failed(kt, kf, "kr4_change-mp-join");
 	} else if ((kf->flags & F_ECMP) && kr->next != NULL) {
 		/*
 		 * ECMP: matchgw found this nexthop already in the chain.
@@ -663,8 +646,6 @@ kr4_change(struct ktable *kt, struct kroute_full *kf)
 		 */
 		if (send_rtmsg(RTM_CHANGE, kt, kf))
 			kr->flags |= F_BGPD_INSERTED;
-		else
-			kdiag_install_failed(kt, kf, "kr4_change-mp-resend");
 	} else {
 		int was_multipath = (kr->next != NULL);
 		if (was_multipath) {
@@ -706,8 +687,6 @@ kr4_change(struct ktable *kt, struct kroute_full *kf)
 
 		if (send_rtmsg(was_multipath ? RTM_ADD : RTM_CHANGE, kt, kf))
 			kr->flags |= F_BGPD_INSERTED;
-		else
-			kdiag_install_failed(kt, kf, "kr4_change-update");
 	}
 
 	return (0);
@@ -752,13 +731,9 @@ kr6_change(struct ktable *kt, struct kroute_full *kf)
 
 		if (send_rtmsg(RTM_CHANGE, kt, kf))
 			kr6n->flags |= F_BGPD_INSERTED;
-		else
-			kdiag_install_failed(kt, kf, "kr6_change-mp-join");
 	} else if ((kf->flags & F_ECMP) && kr6->next != NULL) {
 		if (send_rtmsg(RTM_CHANGE, kt, kf))
 			kr6->flags |= F_BGPD_INSERTED;
-		else
-			kdiag_install_failed(kt, kf, "kr6_change-mp-resend");
 	} else {
 		int was_multipath = (kr6->next != NULL);
 		if (was_multipath) {
@@ -801,8 +776,6 @@ kr6_change(struct ktable *kt, struct kroute_full *kf)
 
 		if (send_rtmsg(was_multipath ? RTM_ADD : RTM_CHANGE, kt, kf))
 			kr6->flags |= F_BGPD_INSERTED;
-		else
-			kdiag_install_failed(kt, kf, "kr6_change-update");
 	}
 
 	return (0);
@@ -1927,12 +1900,9 @@ kroute_insert(struct ktable *kt, struct kroute_full *kf)
 			multipath = 1;
 		}
 
-		if ((kf->flags & F_BGPD) && !multipath) {
+		if ((kf->flags & F_BGPD) && !multipath)
 			if (send_rtmsg(RTM_ADD, kt, kf))
 				kr->flags |= F_BGPD_INSERTED;
-			else
-				kdiag_install_failed(kt, kf, "kroute_insert4");
-		}
 		break;
 	case AID_INET6:
 	case AID_VPN_IPv6:
@@ -1967,12 +1937,9 @@ kroute_insert(struct ktable *kt, struct kroute_full *kf)
 			multipath = 1;
 		}
 
-		if ((kf->flags & F_BGPD) && !multipath) {
+		if ((kf->flags & F_BGPD) && !multipath)
 			if (send_rtmsg(RTM_ADD, kt, kf))
 				kr6->flags |= F_BGPD_INSERTED;
-			else
-				kdiag_install_failed(kt, kf, "kroute_insert6");
-		}
 		break;
 	}
 
@@ -2200,9 +2167,7 @@ kroute_remove(struct ktable *kt, struct kroute_full *kf, int any)
 				break;
 			}
 			}
-			if (!send_rtmsg(RTM_ADD, kt, &ekf))
-				kdiag_install_failed(kt, &ekf,
-				    "kroute_remove-mp-reinstall");
+			send_rtmsg(RTM_ADD, kt, &ekf);
 		} else {
 			send_rtmsg(RTM_DELETE, kt, kf);
 		}
@@ -2484,36 +2449,16 @@ knexthop_true_nexthop(struct ktable *kt, struct kroute_full *kf)
 
 	kn = knexthop_find(kt, &kf->nexthop);
 	if (kn == NULL) {
-		log_warnx("KDIAG: %s: nexthop %s not found", __func__,
+		log_warnx("%s: nexthop %s not found", __func__,
 		    log_addr(&kf->nexthop));
 		return 0;
 	}
-	if (kn->kroute == NULL) {
-		char n[64];
-
-		kdiag_addrstr(&kf->nexthop, n, sizeof(n));
-		log_warnx("KDIAG: %s: nexthop %s has no resolving kernel "
-		    "route (kn->kroute NULL)", __func__, n);
+	if (kn->kroute == NULL)
 		return 0;
-	}
 
 	switch (kn->nexthop.aid) {
 	case AID_INET:
 		kr = kn->kroute;
-		if (kf->prefixlen == 0) {
-			char n[64], rp[64], g[64];
-
-			kdiag_addrstr(&kf->nexthop, n, sizeof(n));
-			inet_ntop(AF_INET, &kr->prefix, rp, sizeof(rp));
-			inet_ntop(AF_INET, &kr->nexthop, g, sizeof(g));
-			log_warnx("KDIAG: true_nexthop %s (default-route "
-			    "install): resolved via %s/%u prio %u flags "
-			    "%#06x if %u gw %s%s", n, rp, kr->prefixlen,
-			    kr->priority, kr->flags, kr->ifindex, g,
-			    (kr->flags & F_CONNECTED) ?
-			    " connected, keeping nexthop" :
-			    " NOT connected, SUBSTITUTING gateway");
-		}
 		if (kr->flags & F_CONNECTED)
 			return 1;
 		gateway.aid = AID_INET;
@@ -2521,20 +2466,6 @@ knexthop_true_nexthop(struct ktable *kt, struct kroute_full *kf)
 		break;
 	case AID_INET6:
 		kr6 = kn->kroute;
-		if (kf->prefixlen == 0) {
-			char n[64], rp[64], g[64];
-
-			kdiag_addrstr(&kf->nexthop, n, sizeof(n));
-			inet_ntop(AF_INET6, &kr6->prefix, rp, sizeof(rp));
-			inet_ntop(AF_INET6, &kr6->nexthop, g, sizeof(g));
-			log_warnx("KDIAG: true_nexthop %s (default-route "
-			    "install): resolved via %s/%u prio %u flags "
-			    "%#06x if %u gw %s%s", n, rp, kr6->prefixlen,
-			    kr6->priority, kr6->flags, kr6->ifindex, g,
-			    (kr6->flags & F_CONNECTED) ?
-			    " connected, keeping nexthop" :
-			    " NOT connected, SUBSTITUTING gateway");
-		}
 		if (kr6->flags & F_CONNECTED)
 			return 1;
 		gateway.aid = AID_INET6;
@@ -3177,8 +3108,8 @@ send_rtmsg(int action, struct ktable *kt, struct kroute_full *kf)
 	char buf[MNL_SOCKET_BUFFER_SIZE];
 	struct nlmsghdr *nlh;
 	struct rtmsg *rtm;
-	const char *kdiag_enc = "no-gw";	/* KDIAG: encoding taken */
-	uint16_t kdiag_ifidx = 0;
+	const char *enc = "no-gw";	/* encoding taken, for NACK decode */
+	uint16_t enc_ifidx = 0;
 
 	if (!kt->fib_sync)
 		return (0);
@@ -3257,7 +3188,7 @@ send_rtmsg(int action, struct ktable *kt, struct kroute_full *kf)
 			memcpy(RTA_DATA(rta), &kf->nexthop.v4.s_addr,
 			    gwlen);
 			mnl_attr_put(nlh, RTA_MULTIPATH, nhlen, mpbuf);
-			kdiag_enc = "del-mp-gw";
+			enc = "del-mp-gw";
 			goto skip_gw;
 		} else if (kf->prefix.aid == AID_INET6) {
 			gwlen = sizeof(struct in6_addr);
@@ -3281,8 +3212,8 @@ send_rtmsg(int action, struct ktable *kt, struct kroute_full *kf)
 				    gwlen);
 				mnl_attr_put(nlh, RTA_MULTIPATH, nhlen,
 				    mpbuf);
-				kdiag_enc = "del-mp-gw-onlink";
-				kdiag_ifidx = ifidx;
+				enc = "del-mp-gw-onlink";
+				enc_ifidx = ifidx;
 				goto skip_gw;
 			}
 		}
@@ -3291,7 +3222,7 @@ send_rtmsg(int action, struct ktable *kt, struct kroute_full *kf)
 	    (kf->flags & F_ECMP) &&
 	    !(kf->flags & (F_BLACKHOLE|F_REJECT))) {
 		if (add_multipath_attr(nlh, kt, kf) > 0) {
-			kdiag_enc = "mp-ecmp";
+			enc = "mp-ecmp";
 			goto skip_gw;
 		}
 	}
@@ -3315,7 +3246,7 @@ send_rtmsg(int action, struct ktable *kt, struct kroute_full *kf)
 		u_short ifidx = kf->ifindex;
 
 		if (ifidx != 0)
-			kdiag_enc = "onlink-kf";
+			enc = "onlink-kf";
 		if (ifidx == 0) {
 			struct bgpd_addr nh;
 			struct kroute6 *nhkr;
@@ -3325,24 +3256,14 @@ send_rtmsg(int action, struct ktable *kt, struct kroute_full *kf)
 			nhkr = kroute6_match(kt, &nh, 1);
 			if (nhkr != NULL) {
 				ifidx = nhkr->ifindex;
-				kdiag_enc = "onlink-mirror";
+				enc = "onlink-mirror";
 			}
 		}
 		if (ifidx == 0) {
 			ifidx = resolve_v6_ifindex(&kf->nexthop.v6);
 			if (ifidx != 0)
-				kdiag_enc = "onlink-kernq";
+				enc = "onlink-kernq";
 		}
-
-		if (ifidx == 0) {
-			char n[64];
-
-			kdiag_addrstr(&kf->nexthop, n, sizeof(n));
-			log_warnx("KDIAG: v6 single-nexthop ifidx UNRESOLVED "
-			    "for gw %s - falling back to plain RTA_GATEWAY "
-			    "(kernel may reject)", n);
-		}
-
 		if (ifidx != 0) {
 			memset(mpbuf, 0, nhlen);
 			rtnh = (struct rtnexthop *)mpbuf;
@@ -3358,7 +3279,7 @@ send_rtmsg(int action, struct ktable *kt, struct kroute_full *kf)
 			memcpy(RTA_DATA(rta), &kf->nexthop.v6, gwlen);
 
 			mnl_attr_put(nlh, RTA_MULTIPATH, nhlen, mpbuf);
-			kdiag_ifidx = ifidx;
+			enc_ifidx = ifidx;
 			goto skip_gw;
 		}
 	}
@@ -3368,7 +3289,7 @@ send_rtmsg(int action, struct ktable *kt, struct kroute_full *kf)
 			if (kf->nexthop.aid != AID_UNSPEC) {
 				mnl_attr_put_u32(nlh, RTA_GATEWAY,
 				    kf->nexthop.v4.s_addr);
-				kdiag_enc = "plain-gw";
+				enc = "plain-gw";
 			}
 			break;
 		case AID_INET6:
@@ -3376,14 +3297,14 @@ send_rtmsg(int action, struct ktable *kt, struct kroute_full *kf)
 				mnl_attr_put(nlh, RTA_GATEWAY,
 				    sizeof(struct in6_addr),
 				    &kf->nexthop.v6);
-				kdiag_enc = "plain-gw";
+				enc = "plain-gw";
 			}
 			break;
 		}
 	}
 
 skip_gw:
-	kdiag_record(nlh->nlmsg_seq, action, kf, kdiag_ifidx, kdiag_enc);
+	nlreq_record(nlh->nlmsg_seq, action, kf, enc_ifidx, enc);
 	if (mnl_socket_sendto(kr_state.nl, nlh, nlh->nlmsg_len) < 0) {
 		log_warn("%s: action %u, prefix %s/%u", __func__,
 		    nlh->nlmsg_type, log_addr(&kf->prefix),
@@ -3618,50 +3539,6 @@ mnl_callback(const struct nlmsghdr *nlh, void *data)
 		if (dispatch_rtmsg_addr(nlh, rm, tb, &kf) == -1)
 			return MNL_CB_OK;
 
-		/*
-		 * KDIAG: cross-daemon slot-theft detector. A foreign
-		 * process modified the kernel entry for a prefix we
-		 * believe we have installed (mesh bgpd, ifupdown, human).
-		 */
-		if (nlh->nlmsg_pid != kr_state.pid &&
-		    nlh->nlmsg_seq != kr_state.query_seq) {
-			int installed = 0;
-
-			switch (kf.prefix.aid) {
-			case AID_INET: {
-				struct kroute *mine = kroute_find(kt,
-				    &kf.prefix, kf.prefixlen, RTP_MINE);
-				if (mine != NULL &&
-				    (mine->flags & F_BGPD_INSERTED))
-					installed = 1;
-				break;
-			}
-			case AID_INET6: {
-				struct kroute6 *mine6 = kroute6_find(kt,
-				    &kf.prefix, kf.prefixlen, RTP_MINE);
-				if (mine6 != NULL &&
-				    (mine6->flags & F_BGPD_INSERTED))
-					installed = 1;
-				break;
-			}
-			}
-			if (installed) {
-				char p[64], g[64];
-
-				kdiag_addrstr(&kf.prefix, p, sizeof(p));
-				kdiag_addrstr(&kf.nexthop, g, sizeof(g));
-				log_warnx("KDIAG: foreign %s for installed "
-				    "prefix %s/%u: pid %u proto %u metric %u "
-				    "gw %s dev %u",
-				    nlh->nlmsg_type == RTM_NEWROUTE ?
-				    "NEWROUTE" : "DELROUTE", p, kf.prefixlen,
-				    nlh->nlmsg_pid, rm->rtm_protocol,
-				    tb[RTA_PRIORITY] != NULL ?
-				    mnl_attr_get_u32(tb[RTA_PRIORITY]) : 0,
-				    g, kf.ifindex);
-			}
-		}
-
 		switch (nlh->nlmsg_type) {
 		case RTM_NEWROUTE:
 			if (kr_fib_change(kt, &kf, rm->rtm_type, 0) == -1)
@@ -3701,7 +3578,7 @@ dispatch_rtmsg(void)
 	ret = mnl_socket_recvfrom(kr_state.nl, buf, sizeof buf);
 	while (ret > 0) {
 		switch (mnl_cb_run2(buf, ret, 0, 0, mnl_callback, NULL,
-		    kdiag_ctl_cbs, NLMSG_MIN_TYPE)) {
+		    nl_ctl_cbs, NLMSG_MIN_TYPE)) {
 		case MNL_CB_STOP:
 			return (0);
 		case MNL_CB_ERROR:
