@@ -643,17 +643,14 @@ prefix_evaluate(struct rib_entry *re, struct prefix *new, struct prefix *old)
 			rde_send_kroute(re_rib(re), ep, NULL);
 			rde_send_kroute(re_rib(re), newbest, NULL);
 		}
-		else if (old != NULL) {
+		else if (ecmp && old != NULL) {
 			/*
-			 * ECMP sibling withdrawn: send a DELETE for the
-			 * old nexthop so kr_delete -> kroute_remove can
-			 * purge it from the multipath chain, then resend
-			 * the remaining ECMP sibling as primary.
-			 *
-			 * KDIAG NOTE: this branch is NOT gated on ecmp -
-			 * it fires for ANY backup-path withdrawal (defect 2
-			 * trigger). The DELETE below carries no nexthop, so
-			 * kroute_remove takes out the installed best route.
+			 * A path was withdrawn while best is unchanged AND
+			 * the best is part of a real ECMP set: a sibling may
+			 * have left, so rebuild the kernel multipath. DELETE
+			 * the old nexthop then resend the remaining ECMP
+			 * sibling (or the best) so kr_delete -> kroute_remove
+			 * purges just the withdrawn path from the chain.
 			 */
 			{
 				struct bgpd_addr kdaddr;
@@ -661,14 +658,12 @@ prefix_evaluate(struct rib_entry *re, struct prefix *new, struct prefix *old)
 
 				pt_getaddr(newbest->pt, &kdaddr);
 				kdiag_addr(&kdaddr, kdp, sizeof(kdp));
-				log_warnx("KDIAG: backup-withdraw FIB churn "
+				log_warnx("KDIAG: ecmp-sibling-withdraw "
 				    "%s/%u: withdrawn nh %s, best nh %s "
-				    "unchanged (ecmp=%d ep=%s) - whole-route "
-				    "DELETE + reinstall of best", kdp,
+				    "(ecmp set) - rebuild multipath", kdp,
 				    newbest->pt->prefixlen,
 				    kdiag_nhstr(old, kdo, sizeof(kdo)),
-				    kdiag_nhstr(newbest, kdn, sizeof(kdn)),
-				    ecmp, ep != NULL ? "yes" : "no");
+				    kdiag_nhstr(newbest, kdn, sizeof(kdn)));
 			}
 			rde_send_kroute(rib, NULL, old);
 			if (ep != NULL &&
@@ -676,6 +671,37 @@ prefix_evaluate(struct rib_entry *re, struct prefix *new, struct prefix *old)
 				rde_send_kroute(rib, ep, NULL);
 			else
 				rde_send_kroute(rib, newbest, NULL);
+		}
+		else if (old != NULL) {
+			/*
+			 * DEFECT-2 FIX (2026-07-26): a NON-ECMP path was
+			 * withdrawn while the best is unchanged (e.g. a
+			 * localpref backup default withdrawn while the
+			 * primary survives). The best route is already
+			 * installed correctly in the kernel, so there is
+			 * nothing to do - stock OpenBGPD does nothing here.
+			 *
+			 * The previous fork code fell into the ECMP-sibling
+			 * path unconditionally and issued a whole-route
+			 * DELETE + reinstall. When the reinstall's nexthop
+			 * failed to resolve (poisoned v6 nexthop slot), the
+			 * surviving best-path kernel route was left deleted -
+			 * the ::/0 v6-default outage. Leaving the FIB
+			 * untouched for a non-ECMP backup withdrawal is the
+			 * fix.
+			 */
+			{
+				struct bgpd_addr kdaddr;
+				char kdp[64], kdo[64];
+
+				pt_getaddr(newbest->pt, &kdaddr);
+				kdiag_addr(&kdaddr, kdp, sizeof(kdp));
+				log_warnx("KDIAG: backup-withdraw NO-OP "
+				    "%s/%u: withdrawn nh %s, best unchanged "
+				    "(non-ecmp) - FIB untouched (defect-2 fix)",
+				    kdp, newbest->pt->prefixlen,
+				    kdiag_nhstr(old, kdo, sizeof(kdo)));
+			}
 		}
 	}
 
