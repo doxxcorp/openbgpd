@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <time.h>
 
 #include "bgpd.h"
 #include "log.h"
@@ -3669,6 +3670,97 @@ kr_fib_delete(struct ktable *kt, struct kroute_full *kf, int mpath)
 	return kroute_remove(kt, kf, !mpath);
 }
 
+/*
+ * ECMP defence against a second bgpd instance writing the same prefix.
+ *
+ * On a PM two daemons (mesh bgpd and inet-bgpd) run with fib-update on
+ * the same kernel table, same protocol (RTPROT_BGP) and same metric, so
+ * their routes for a service VIP are literally the same kernel entry.
+ * Only the mesh daemon has fib-multipath for the VIP; inet-bgpd installs
+ * a single-nexthop route for it whenever its owner iBGP sessions
+ * converge. Whoever writes last wins. Our own multipath sits in the
+ * kroute tree at RTP_MINE, the kernel reports the other daemon's route at
+ * priority kr_state.fib_prio, so kroute_find() never meets our entry and
+ * we kept believing the multipath was installed (F_BGPD_INSERTED) while
+ * the kernel held one nexthop. Seen on pm1/pm2.zrh1 Nov 2 2026: owner
+ * iBGP came up after the start-time ECMP syncs and all 18 VIPs collapsed
+ * to one nexthop until bgpd was restarted (BM-20261102-005).
+ *
+ * If a route arrives from another writer at our protocol, with a single
+ * gateway, for a prefix we hold as an installed multipath chain, re-push
+ * the full chain. The other daemon has no chain for the prefix, so it
+ * never answers in kind: the ECMP owner wins and the FIB settles. A
+ * multipath message (no RTA_GATEWAY) from another writer is left alone.
+ * Returns 1 when the event was consumed.
+ */
+static int
+kr_ecmp_defend(struct ktable *kt, struct kroute_full *kf)
+{
+	static time_t	 window;
+	static int	 pushes;
+	time_t		 now;
+
+	if (kf->priority != kr_state.fib_prio || (kf->flags & F_BGPD))
+		return (0);
+	if (kf->nexthop.aid == AID_UNSPEC || (kf->flags & F_CONNECTED))
+		return (0);
+
+	switch (kf->prefix.aid) {
+	case AID_INET: {
+		struct kroute *kr;
+
+		kr = kroute_find(kt, &kf->prefix, kf->prefixlen, RTP_MINE);
+		if (kr == NULL || kr->next == NULL ||
+		    !(kr->flags & F_BGPD_INSERTED))
+			return (0);
+		now = time(NULL);
+		if (now != window) {
+			window = now;
+			pushes = 0;
+		}
+		if (++pushes > 256) {
+			if (pushes == 257)
+				log_warnx("ECMP: external rewrite storm, "
+				    "defence throttled this second");
+			return (1);
+		}
+		log_info("ECMP: %s/%u rewritten by another writer "
+		    "(single nexthop %s), re-installing multipath",
+		    log_addr(&kf->prefix), kf->prefixlen,
+		    log_addr(&kf->nexthop));
+		send_rtmsg(RTM_CHANGE, kt, kr_tofull(kr));
+		return (1);
+	}
+	case AID_INET6: {
+		struct kroute6 *kr6;
+
+		kr6 = kroute6_find(kt, &kf->prefix, kf->prefixlen, RTP_MINE);
+		if (kr6 == NULL || kr6->next == NULL ||
+		    !(kr6->flags & F_BGPD_INSERTED))
+			return (0);
+		now = time(NULL);
+		if (now != window) {
+			window = now;
+			pushes = 0;
+		}
+		if (++pushes > 256) {
+			if (pushes == 257)
+				log_warnx("ECMP: external rewrite storm, "
+				    "defence throttled this second");
+			return (1);
+		}
+		log_info("ECMP: %s/%u rewritten by another writer "
+		    "(single nexthop %s), re-installing multipath",
+		    log_addr(&kf->prefix), kf->prefixlen,
+		    log_addr(&kf->nexthop));
+		send_rtmsg(RTM_CHANGE, kt, kr6_tofull(kr6));
+		return (1);
+	}
+	default:
+		return (0);
+	}
+}
+
 int
 kr_fib_change(struct ktable *kt, struct kroute_full *kf, int type, int mpath)
 {
@@ -3677,6 +3769,9 @@ kr_fib_change(struct ktable *kt, struct kroute_full *kf, int type, int mpath)
 	int		 flags, oflags;
 	int		 changed = 0, rtlabel_changed = 0;
 	uint16_t	 new_labelid;
+
+	if (kr_ecmp_defend(kt, kf))
+		return (0);
 
 	flags = kf->flags;
 	switch (kf->prefix.aid) {
