@@ -10,8 +10,9 @@ doxx.net OpenBGPd (`doxxcorp/openbgpd`) with ECMP multipath FIB support for Linu
 | Binary path on servers | `/usr/sbin/bgpd` (both mesh bgpd and inet-bgpd use the same binary) |
 | Control sockets | `/usr/local/var/run/bgpd.sock.0` (mesh), `/usr/local/var/run/bgpd.sock.1` (inet) |
 | Control binaries | `bgpctl` (mesh, port 178), `bgpctli` (inet, port 179) - both are symlinks or copies of the same `bgpctl` binary |
+| Current release | `9.2-doxx6` (bgpd md5 `4ffc1c537ba5`, sha256 `54c1ea72a236...eb16b`) |
 | Deploy packages on ops servers | `/var/lib/doxx/openbgpd-doxx.tar.gz` (source), `/var/lib/doxx/openbgpd-doxx-bins.tar.gz` (pre-built) |
-| Ops servers | `ops1.phx1.doxx.net`, `ops2.mia1.doxx.net` |
+| Infra API nodes (serve the tarballs) | `infra1.mia1` (ops4.mia1), `infra1.pao1` (ops2.pao1) |
 | Infra API endpoint | `serve_openbgpd_source`, `serve_openbgpd_bins` |
 
 ## Building
@@ -172,14 +173,17 @@ tar czf /tmp/openbgpd-doxx-bins.tar.gz bgpd bgpctl RELEASE VERSION checksums.txt
 Both ops servers must have identical copies:
 
 ```bash
-scp /tmp/openbgpd-doxx.tar.gz blyon@ops1.phx1.doxx.net:/tmp/
-scp /tmp/openbgpd-doxx-bins.tar.gz blyon@ops1.phx1.doxx.net:/tmp/
-ssh blyon@ops1.phx1.doxx.net "sudo mv /var/lib/doxx/openbgpd-doxx.tar.gz /var/lib/doxx/openbgpd-doxx.tar.gz.bak && \
-    sudo mv /var/lib/doxx/openbgpd-doxx-bins.tar.gz /var/lib/doxx/openbgpd-doxx-bins.tar.gz.bak && \
-    sudo mv /tmp/openbgpd-doxx.tar.gz /var/lib/doxx/ && \
-    sudo mv /tmp/openbgpd-doxx-bins.tar.gz /var/lib/doxx/"
-
-# Repeat for ops2.mia1.doxx.net
+# Upload to BOTH infra API nodes: infra1.mia1 (ops4.mia1) and infra1.pao1 (ops2.pao1)
+for n in infra1.mia1 infra1.pao1; do
+  scp /tmp/openbgpd-doxx.tar.gz /tmp/openbgpd-doxx-bins.tar.gz blyon@$n.doxx.net:/tmp/
+  ssh blyon@$n.doxx.net "cd /var/lib/doxx && \
+    sudo cp -p openbgpd-doxx.tar.gz openbgpd-doxx.tar.gz.bak-<oldrel> && \
+    sudo cp -p openbgpd-doxx-bins.tar.gz openbgpd-doxx-bins.tar.gz.bak-<oldrel> && \
+    sudo mv /tmp/openbgpd-doxx.tar.gz /tmp/openbgpd-doxx-bins.tar.gz /var/lib/doxx/ && \
+    sudo chown root:root openbgpd-doxx*.tar.gz && sudo chmod 644 openbgpd-doxx*.tar.gz"
+done
+# Verify both backends serve identical, non-truncated tarballs (round-robin trap, BM-20260922-010):
+#   curl -s -X POST https://infra.doxx.net/ -H "X-Admin-Token: $TOKEN" -d serve_openbgpd_bins=1 -o /tmp/b.tgz  (pull several times, md5 must be stable)
 ```
 
 The infra API serves these via:
@@ -187,6 +191,37 @@ The infra API serves these via:
 - `https://infra.doxx.net/?serve_openbgpd_bins` - pre-built binaries
 
 ## Key Patches (doxx.net fork)
+
+### kr_ecmp_defend - re-install our multipath when another writer overwrites it (9.2-doxx6)
+
+**Files:** `src/bgpd/kroute-linux.c` (`kr_ecmp_defend`, called first in `kr_fib_change`).
+
+On a PM mesh `bgpd` (fib-multipath for the service VIPs) and `inet-bgpd`
+(single nexthop) write the SAME kernel entry (same table, proto bgp, metric).
+When netlink reports a route from another writer at our protocol with a single
+`RTA_GATEWAY` for a prefix we hold as an installed multipath chain
+(`kroute` at `RTP_MINE`, `next != NULL`, `F_BGPD_INSERTED`), we re-send the full
+chain via `send_rtmsg(RTM_CHANGE)` with `RTA_MULTIPATH`. The single-nexthop
+daemon has no chain for the prefix so it never answers in kind; the ECMP owner
+wins and the FIB settles. v4 and v6. Log line: `ECMP: <prefix> rewritten by
+another writer (single nexthop <gw>), re-installing multipath`. This is the
+durable fix for the post-reboot VIP ECMP collapse (BM-20261102-005).
+
+Two refinements proven in the ZRH1 A/B (BM-20261102-015/-017/-020):
+- The re-push must force `F_ECMP` on the `kroute_full` (the chain head can lack
+  it) or `send_rtmsg` emits a single-gateway route (commit 3f5d08c).
+- A per-prefix cooldown (`ECMP_DEFEND_COOLDOWN=2s`, 64-slot ring) plus the
+  global 256/s storm throttle: both daemons run the defence and each owns its
+  own ECMP prefixes, so without a per-prefix backoff they re-push each other in
+  a tight loop that pins the parent at 100% in `do_sys_poll()`. One prompt
+  re-push beats a clobber on an iBGP convergence event; a persistent clobber
+  falls to the +20s delayed ECMP resync (commit 695eeaf).
+
+Release 9.2-doxx6 = fork commit `695eeaf` (89e2d2b + 3f5d08c + 695eeaf).
+bgpd md5 `4ffc1c537ba5`, sha256 `54c1ea72a236050732f0dbd2542ef36254e277bed8c93ba4986a8f50096eb16b`;
+bgpctl md5 `76ac46d8f934`. Validated binary - ship THIS binary (autotools is not
+bit-reproducible), not a rebuild, so fleet md5 checks stay meaningful.
+
 
 ### peer_up() Adj-RIB-Out resync (a23bb98, 9.2-doxx4)
 
