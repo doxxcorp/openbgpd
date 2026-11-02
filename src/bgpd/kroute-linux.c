@@ -3692,7 +3692,69 @@ kr_fib_delete(struct ktable *kt, struct kroute_full *kf, int mpath)
  * never answers in kind: the ECMP owner wins and the FIB settles. A
  * multipath message (no RTA_GATEWAY) from another writer is left alone.
  * Returns 1 when the event was consumed.
+ *
+ * Loop break (pm1.zrh1 Nov 2 2026, BM-20261102-015): on a PM BOTH daemons
+ * run this defence and each holds its own ECMP prefixes (mesh: the VIP
+ * /32,/128; inet-bgpd: the CC service prefixes it learns multipath). Our
+ * re-push changes the kernel entry, which the other daemon reacts to by
+ * re-asserting its own view, which we then re-defend: a tight re-push
+ * feedback that pinned the parent at 100% in do_sys_poll(). The global
+ * per-second throttle capped sends but not wakeups, so it still spun.
+ * Fix: a per-prefix cooldown - defend a given prefix at most once per
+ * ECMP_DEFEND_COOLDOWN seconds. One prompt re-push beats a clobber on an
+ * iBGP convergence event; a genuinely persistent clobber is left to the
+ * +20s delayed ECMP resync (rde.c) instead of a hot loop. In steady
+ * state nothing clobbers, so the cooldown never engages.
  */
+#define	ECMP_DEFEND_COOLDOWN	2	/* seconds between re-pushes per prefix */
+#define	ECMP_DEFEND_SLOTS	64
+
+static int
+ecmp_defend_cooldown(const struct bgpd_addr *prefix, uint8_t prefixlen,
+    time_t now)
+{
+	static struct {
+		time_t	 t;
+		uint8_t	 aid;
+		uint8_t	 prefixlen;
+		uint8_t	 key[16];
+	} log[ECMP_DEFEND_SLOTS];
+	size_t		 i, oldest = 0;
+	uint8_t		 key[16];
+
+	memset(key, 0, sizeof(key));
+	switch (prefix->aid) {
+	case AID_INET:
+		memcpy(key, &prefix->v4.s_addr, sizeof(prefix->v4.s_addr));
+		break;
+	case AID_INET6:
+		memcpy(key, &prefix->v6, sizeof(prefix->v6));
+		break;
+	default:
+		return (0);
+	}
+
+	for (i = 0; i < ECMP_DEFEND_SLOTS; i++) {
+		if (log[i].aid == prefix->aid &&
+		    log[i].prefixlen == prefixlen &&
+		    memcmp(log[i].key, key, sizeof(key)) == 0) {
+			if (now - log[i].t < ECMP_DEFEND_COOLDOWN)
+				return (1);	/* defended recently, skip */
+			log[i].t = now;
+			return (0);
+		}
+		if (log[i].t < log[oldest].t)
+			oldest = i;
+	}
+
+	/* not seen (or evicted): claim the oldest slot */
+	log[oldest].t = now;
+	log[oldest].aid = prefix->aid;
+	log[oldest].prefixlen = prefixlen;
+	memcpy(log[oldest].key, key, sizeof(key));
+	return (0);
+}
+
 static int
 kr_ecmp_defend(struct ktable *kt, struct kroute_full *kf)
 {
@@ -3734,6 +3796,8 @@ kr_ecmp_defend(struct ktable *kt, struct kroute_full *kf)
 				    "defence throttled this second");
 			return (1);
 		}
+		if (ecmp_defend_cooldown(&kf->prefix, kf->prefixlen, now))
+			return (1);	/* defended this prefix moments ago */
 		log_info("ECMP: %s/%u rewritten by another writer "
 		    "(single nexthop %s), re-installing multipath",
 		    log_addr(&kf->prefix), kf->prefixlen,
@@ -3762,6 +3826,8 @@ kr_ecmp_defend(struct ktable *kt, struct kroute_full *kf)
 				    "defence throttled this second");
 			return (1);
 		}
+		if (ecmp_defend_cooldown(&kf->prefix, kf->prefixlen, now))
+			return (1);	/* defended this prefix moments ago */
 		log_info("ECMP: %s/%u rewritten by another writer "
 		    "(single nexthop %s), re-installing multipath",
 		    log_addr(&kf->prefix), kf->prefixlen,
