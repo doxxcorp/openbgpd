@@ -3705,9 +3705,19 @@ kr_ecmp_defend(struct ktable *kt, struct kroute_full *kf)
 	if (kf->nexthop.aid == AID_UNSPEC || (kf->flags & F_CONNECTED))
 		return (0);
 
+	/*
+	 * The chain head may lack F_ECMP: the RDE only tags a kroute
+	 * message F_ECMP when an ECMP sibling exists at send time, so a
+	 * VIP first installed with one owner keeps a plain head and the
+	 * chaining branches in kr4_change()/kr6_change() never retag it.
+	 * send_rtmsg() picks RTA_MULTIPATH off kf->flags, so force it
+	 * here or the re-push is a single-gateway route (seen on
+	 * pm1.zrh1 Nov 2 2026: .201/32 came back single via the head).
+	 */
 	switch (kf->prefix.aid) {
 	case AID_INET: {
 		struct kroute *kr;
+		struct kroute_full *rkf;
 
 		kr = kroute_find(kt, &kf->prefix, kf->prefixlen, RTP_MINE);
 		if (kr == NULL || kr->next == NULL ||
@@ -3728,11 +3738,14 @@ kr_ecmp_defend(struct ktable *kt, struct kroute_full *kf)
 		    "(single nexthop %s), re-installing multipath",
 		    log_addr(&kf->prefix), kf->prefixlen,
 		    log_addr(&kf->nexthop));
-		send_rtmsg(RTM_CHANGE, kt, kr_tofull(kr));
+		rkf = kr_tofull(kr);
+		rkf->flags |= F_ECMP;
+		send_rtmsg(RTM_CHANGE, kt, rkf);
 		return (1);
 	}
 	case AID_INET6: {
 		struct kroute6 *kr6;
+		struct kroute_full *rkf;
 
 		kr6 = kroute6_find(kt, &kf->prefix, kf->prefixlen, RTP_MINE);
 		if (kr6 == NULL || kr6->next == NULL ||
@@ -3753,7 +3766,9 @@ kr_ecmp_defend(struct ktable *kt, struct kroute_full *kf)
 		    "(single nexthop %s), re-installing multipath",
 		    log_addr(&kf->prefix), kf->prefixlen,
 		    log_addr(&kf->nexthop));
-		send_rtmsg(RTM_CHANGE, kt, kr6_tofull(kr6));
+		rkf = kr6_tofull(kr6);
+		rkf->flags |= F_ECMP;
+		send_rtmsg(RTM_CHANGE, kt, rkf);
 		return (1);
 	}
 	default:
